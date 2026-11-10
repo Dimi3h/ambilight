@@ -1,8 +1,14 @@
 #!/bin/sh
-# ambilightctl start|stop|restart|status - control the ambilight service on the TV.
-#   start   clear any disable flag and the boot-loop counter, start the supervisor now
-#   stop    write the disable flag (persists across reboots), stop the service
-#   status  supervisor/service state, disable reason, recent log lines
+# ambilightctl - control the ambilight service on the TV (also used by the settings app
+# through Homebrew Channel's exec).
+#   start              clear the disable flag and the boot-loop counter, start now
+#   stop               write the disable flag (persists across reboots), stop the service
+#   restart            stop, then start
+#   status             human-readable state, disable reason, recent log lines
+#   json-status        the same as one JSON object (for the settings app)
+#   set key=value ...  change settings and apply them without a restart; keys:
+#                      host, port (1-65535), priority (1-253), gain (0.1-3.0),
+#                      letterbox (on|off), uiblend (on|off). Prints {"ok":...}.
 SVC_DIR=/media/developer/apps/usr/palm/services/io.github.dimi3h.ambilight.service
 STATE=/media/developer/ambilight
 mkdir -p "$STATE"
@@ -27,7 +33,6 @@ start() {
     sync
     setsid "$SVC_DIR/supervise.sh" now < /dev/null > /dev/null 2>&1 &
     sleep 1
-    status
 }
 
 status() {
@@ -36,13 +41,109 @@ status() {
     if [ -L /var/lib/webosbrew/init.d/70-ambilight ]; then echo "autostart:  hook installed"; else echo "autostart:  no hook"; fi
     if [ -e "$STATE/disable" ]; then echo "disabled:   $(tail -n 1 "$STATE/disable")"; else echo "disabled:   no"; fi
     echo "boot count: $(cat "$STATE/boot-attempts" 2> /dev/null || echo 0) (3 = boot-loop guard trips)"
-    [ -f "$STATE/ambilight.log" ] && { echo "--- last log lines"; tail -n 5 "$STATE/ambilight.log"; }
+    if [ -f "$STATE/ambilight.log" ]; then
+        echo "--- last log lines"
+        tail -n 5 "$STATE/ambilight.log"
+    fi
+}
+
+# --- settings: read $STATE/args into variables (defaults first)
+read_settings() {
+    host=192.168.129.249 port=19444 priority=150 gain=1.0 letterbox=on uiblend=on
+    # shellcheck disable=SC2046 # word splitting of the args file is intended
+    set -- $(cat "$STATE/args" 2> /dev/null)
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --host) host=$2; shift ;;
+            --port) port=$2; shift ;;
+            --priority) priority=$2; shift ;;
+            --gain) gain=$2; shift ;;
+            --no-letterbox) letterbox=off ;;
+            --no-ui-blend) uiblend=off ;;
+        esac
+        shift
+    done
+}
+
+write_settings() {
+    line="--host $host --port $port --priority $priority --gain $gain"
+    [ "$letterbox" = off ] && line="$line --no-letterbox"
+    [ "$uiblend" = off ] && line="$line --no-ui-blend"
+    echo "$line" > "$STATE/args.tmp" && mv "$STATE/args.tmp" "$STATE/args"
+    sync
+}
+
+fail() { printf '{"ok":false,"error":"%s"}\n' "$1"; exit 1; }
+
+set_settings() {
+    read_settings
+    for kv in "$@"; do
+        k=${kv%%=*}
+        v=${kv#*=}
+        case "$k" in
+            host)
+                case "$v" in '' | *[!A-Za-z0-9.-]*) fail "invalid host" ;; esac
+                [ ${#v} -le 63 ] || fail "invalid host"
+                host=$v ;;
+            port)
+                case "$v" in '' | *[!0-9]*) fail "invalid port" ;; esac
+                [ "$v" -ge 1 ] && [ "$v" -le 65535 ] || fail "invalid port"
+                port=$v ;;
+            priority)
+                case "$v" in '' | *[!0-9]*) fail "invalid priority" ;; esac
+                [ "$v" -ge 1 ] && [ "$v" -le 253 ] || fail "invalid priority"
+                priority=$v ;;
+            gain)
+                case "$v" in '' | *[!0-9.]* | *.*.*) fail "invalid gain" ;; esac
+                awk -v g="$v" 'BEGIN { exit !(g >= 0.1 && g <= 3.0) }' || fail "invalid gain"
+                gain=$v ;;
+            letterbox | uiblend)
+                case "$v" in on | off) ;; *) fail "invalid $k" ;; esac
+                eval "$k=\$v" ;;
+            *) fail "unknown key" ;;
+        esac
+    done
+    write_settings
+    pid=$(cat "$STATE/service.pid" 2> /dev/null)
+    if [ -n "$pid" ] && running; then kill -USR1 "$pid" 2> /dev/null; fi
+    echo '{"ok":true}'
+}
+
+# JSON string from stdin: escape backslash and quote, drop control characters
+jstr() { tr -d '\000-\037' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+
+json_status() {
+    read_settings
+    if running; then r=true; else r=false; fi
+    if pgrep -f "$SVC_DIR/supervise.sh" > /dev/null 2>&1; then sv=true; else sv=false; fi
+    if [ -L /var/lib/webosbrew/init.d/70-ambilight ]; then hook=true; else hook=false; fi
+    if [ -e "$STATE/disable" ]; then dis="\"$(tail -n 1 "$STATE/disable" | jstr)\""; else dis=null; fi
+    bc=$(cat "$STATE/boot-attempts" 2> /dev/null)
+    case "$bc" in '' | *[!0-9]*) bc=0 ;; esac
+    st=null
+    if [ "$r" = true ] && [ -f "$STATE/status.json" ]; then
+        st=$(cat "$STATE/status.json")
+        # stale status (service hung) after 10 s
+        t=$(echo "$st" | sed -n 's/.*"t":\([0-9]*\).*/\1/p')
+        [ -n "$t" ] && [ $(($(date +%s) - t)) -gt 10 ] && st=null
+    fi
+    logl=""
+    if [ -f "$STATE/ambilight.log" ]; then
+        logl=$(tail -n 4 "$STATE/ambilight.log" | while IFS= read -r l; do printf '"%s",' "$(printf '%s' "$l" | jstr)"; done)
+    fi
+    printf '{"running":%s,"supervisor":%s,"autostart":%s,"disabled":%s,"boot_count":%s,' "$r" "$sv" "$hook" "$dis" "$bc"
+    printf '"settings":{"host":"%s","port":%s,"priority":%s,"gain":%s,"letterbox":%s,"ui_blend":%s},' \
+        "$host" "$port" "$priority" "$gain" "$([ "$letterbox" = on ] && echo true || echo false)" \
+        "$([ "$uiblend" = on ] && echo true || echo false)"
+    printf '"status":%s,"log":[%s]}\n' "$st" "${logl%,}"
 }
 
 case "$1" in
-    start) start ;;
+    start) start && status ;;
     stop) stop ;;
-    restart) stop && start ;;
+    restart) stop && start && status ;;
     status | "") status ;;
-    *) echo "usage: $0 start|stop|restart|status" >&2; exit 2 ;;
+    json-status) json_status ;;
+    set) shift; set_settings "$@" ;;
+    *) echo "usage: $0 start|stop|restart|status|json-status|set key=value..." >&2; exit 2 ;;
 esac

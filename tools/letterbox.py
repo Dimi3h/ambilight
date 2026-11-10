@@ -3,7 +3,7 @@
 
 usage: letterbox.py <lb.txt> <cal.txt> <leds.json> <profile_b4.h> [--emit header.h]
 
-lb.txt  : `ambilight --calib-dump --calib-presets 0,1,2,3` capture of app/letterbox.html
+lb.txt  : `ambilight --calib-dump --calib-presets 0,1,2,3` capture of patterns/letterbox.html
           (64x36 UI ground truth, "B" dark fractions, "P" preset switches)
 cal.txt : the preset-0 zone calibration capture (for the preset-0 footprints)
 

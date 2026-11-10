@@ -3,7 +3,7 @@
 
 usage: validate_live.py <calib-dump.txt> <ledrec.jsonl> <leds.json> [--stretch]
 
-Run app/validate.html on the TV while the service runs with --calib-dump (UI ground
+Run patterns/validate.html on the TV while the service runs with --calib-dump (UI ground
 truth) and tools/ledrec.py records HyperHDR's LED stream. Each image shown for >= 1.5 s
 is aligned (dynamic programming, in order) with a stable plateau of the LED stream;
 the report lists the uniform references and the mean absolute error per validation

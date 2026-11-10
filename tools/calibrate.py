@@ -5,7 +5,7 @@ usage: calibrate.py <cal.txt> <leds.json> <out_header.h> [--preview out.png]
 
 The dump holds exact histogram zone means ("H t <16x3 floats>") and, whenever the UI
 plane changed, a 32x18 RGBA grid of it ("U t <576 x r,g,b,a>"), recorded while
-app/calibrate.html showed reference colours, a white cell walking a 16x9 grid and a set
+patterns/calibrate.html showed reference colours, a white cell walking a 16x9 grid and a set
 of validation images. Because the UI plane is the ground truth, no timing schedule is
 needed.
 

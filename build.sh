@@ -15,7 +15,7 @@ CPU="cortex_a9"
 
 mkdir -p build
 echo "Compiling ambilight $VER for $TARGET..."
-zig cc -target "$TARGET" -mcpu="$CPU" -O2 -Wall -Wextra -rdynamic \
+zig cc -target "$TARGET" -mcpu="$CPU" -O2 -Wall -Wextra -rdynamic -DAMBI_VERSION="\"$VER\"" \
     -o build/ambilight src/ambilight.c -ldl -lm
 
 ST=build/stage
@@ -34,13 +34,13 @@ cat > "$ST/usr/palm/services/$SVC/services.json" <<JSON
  "executable":"ambilight","services":[{"name":"$SVC","description":"Ambilight capture"}]}
 JSON
 
-# --- app (placeholder UI; settings app comes in a later step) ---
+# --- app: the settings screen (ui/) ---
 cat > "$ST/usr/palm/applications/$APP/appinfo.json" <<JSON
 {"id":"$APP","version":"$VER","vendor":"Dimi3h","type":"web","main":"index.html",
- "title":"Ambilight","icon":"icon.png","appDescription":"Hybrid ambilight capture for HyperHDR"}
+ "title":"Ambilight","icon":"icon.png","resolution":"1920x1080","disableBackHistoryAPI":true,
+ "appDescription":"Hybrid ambilight capture for HyperHDR"}
 JSON
-printf '<!doctype html><meta charset="utf-8"><title>Ambilight</title><body style="background:#111;color:#eee;font-family:sans-serif;padding:2em"><h1>Ambilight</h1><p>Capture service for HyperHDR. Settings UI coming soon.</p></body>\n' \
-    > "$ST/usr/palm/applications/$APP/index.html"
+cp ui/index.html ui/app.js "$ST/usr/palm/applications/$APP/"
 # small solid icon (80x80 PNG)
 python3 -I - "$ST/usr/palm/applications/$APP/icon.png" <<'PY'
 import struct,zlib,sys

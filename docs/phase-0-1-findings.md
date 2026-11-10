@@ -227,7 +227,7 @@ stopped on the TV, PicCap restored.
 ### Step 3 — zone calibration (done)
 
 New capture (`probe/data/2026-11-10/cal.txt.gz`, 2.5 min on the TV) with the UI plane
-recorded as ground truth at 32x18 (`--calib-dump`) while `app/calibrate.html` showed
+recorded as ground truth at 32x18 (`--calib-dump`) while `patterns/calibrate.html` showed
 references, a white cell walking a 16x9 grid, and 16 validation images.
 
 Measured:
@@ -271,14 +271,14 @@ Live validation on the TV, HyperHDR LED stream recorded from the Mac
 - The C reconstruction equals the Python model to 0.0005/255.
 
 Recalibrating (e.g. after a firmware update): install the IPK, copy
-`app/calibrate.html` over the app's `index.html`, stop PicCap, run
+`patterns/calibrate.html` over the app's `index.html`, stop PicCap, run
 `ambilight --calib-dump cal.txt` for ~140 s while launching the app, then
 `python3 tools/calibrate.py cal.txt leds.json src/profile_b4.h --preview out.png` and
 rebuild. `leds.json` is `serverinfo.info.leds` from HyperHDR.
 
 ### Black bars (21:9) — done
 
-Capture `probe/data/2026-11-10/lb.txt.gz` (`app/letterbox.html`, `--calib-presets 0,1,2,3`,
+Capture `probe/data/2026-11-10/lb.txt.gz` (`patterns/letterbox.html`, `--calib-presets 0,1,2,3`,
 UI ground truth at 64x36, per-zone dark fractions). Analysis: `tools/letterbox.py`.
 
 What the histogram presets measure (walking-cell footprints):
@@ -320,10 +320,10 @@ Live on the TV:
   started it closed). The dark Disney+ menu briefly read as 1-row bars; fixed by the
   opaque-UI rule.
 
-Recalibrating letterbox handling: show `app/letterbox.html`, run
+Recalibrating letterbox handling: show `patterns/letterbox.html`, run
 `ambilight --calib-presets 0,1,2,3 --calib-dump lb.txt` for ~245 s, then
 `python3 tools/letterbox.py lb.txt cal.txt leds.json src/profile_b4.h --emit src/letterbox_b4.h`.
-Live check: `app/letterbox-validate.html` + `tools/ledrec.py` +
+Live check: `patterns/letterbox-validate.html` + `tools/ledrec.py` +
 `tools/validate_live.py <dump> <ledrec> leds.json --stretch` (run the service with
 `--no-ui-blend`, otherwise the opaque test images come from the UI plane).
 
@@ -353,3 +353,20 @@ Installed with `tools/install.sh` and verified on the TV:
 - **Reboot** (`machineReboot`): SSH back after 37 s, the hook started the service at
   uptime 85 s (30 s supervisor delay included), histogram open at once, boot-loop counter
   reset to 0 after 60 s, HyperHDR source active again.
+
+### Settings app — done
+
+App ↔ service: Homebrew Channel's API is in the Luna "public" group and its `exec`
+method runs a shell command as root without checking the caller (read in its
+`service.js`), so the web app (client permission "public") can call it. The app only
+runs `ambilightctl` with fixed sub-commands; values are validated in the app and again
+by `ambilightctl` (tested on the TV: `host=x;reboot`, `host=a$(id)b`, out-of-range port,
+priority and gain, unknown keys - all rejected, settings file untouched). This also
+lets the app start the service when it is not running, which a Luna service could not.
+
+The service reads its settings from `/media/developer/ambilight/args`, reloads them on
+SIGUSR1 (new host/port → reconnect; new priority → the old one is cleared on HyperHDR
+first), and writes `status.json` every 2 s. Tested with the remote on the TV: brightness
+▶▶ reloaded twice without a restart, Ambilight off/on stopped and restarted the service
+with the new settings, Back closed the app. The UI (`ui/`) can be previewed on a desktop
+browser with an in-memory stand-in for `ambilightctl`.

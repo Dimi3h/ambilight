@@ -45,18 +45,39 @@ hold the TV's capture resource at the same time); PicCap stays installed, its co
 backed up to `backups/` and on the TV, and the rollback turns it back on. Re-running the
 script upgrades in place.
 
+## Settings app
+
+Open **Ambilight** from the TV's app list. With the remote (▲▼ choose, OK change,
+◀▶ brightness, Back close) or the pointer you can:
+
+- switch ambilight on or off (off stays off across reboots);
+- set the HyperHDR address, port and priority;
+- adjust brightness (10–300 %);
+- switch black-bar detection and UI blending (menus, subtitles) on or off;
+- see the live state: picture source, HyperHDR connection, detected bars, frames/s,
+  autostart, recent log lines, and the reason if an emergency brake switched it off.
+
+Changes apply immediately, without restarting the service. The app runs
+`ambilightctl` through Homebrew Channel's public `exec` method; every value is checked
+in the app and again by `ambilightctl` (fixed sub-commands, strict character sets), so
+nothing else can reach the shell. The texts are in Dutch.
+
 ## Control (on the TV)
 
 ```sh
-/media/developer/apps/usr/palm/services/io.github.dimi3h.ambilight.service/ambilightctl status
-.../ambilightctl stop      # off, stays off across reboots
-.../ambilightctl start     # on again (also clears the guards below)
+C=/media/developer/apps/usr/palm/services/io.github.dimi3h.ambilight.service/ambilightctl
+$C status                 # human-readable state
+$C stop                   # off, stays off across reboots
+$C start                  # on again (also clears the guards below)
+$C set gain=1.2 uiblend=off   # change settings live: host, port (1-65535), priority (1-253),
+                              # gain (0.1-3.0), letterbox on|off, uiblend on|off
+$C json-status            # everything as JSON (used by the settings app)
 ```
 
-Options for the service go in `/media/developer/ambilight/args` (one line), e.g.
-`--host 192.168.1.20 --port 19444 --priority 150`. Other flags: `--gain`, `--interval`,
-`--no-letterbox`, `--no-ui-blend`, `--status-ms`. Logs: `/media/developer/ambilight/`
-(`ambilight.log`, rotated at 512 KB; `supervise.log`).
+Settings are stored in `/media/developer/ambilight/args` and reloaded by the service on
+`SIGUSR1` (`ambilightctl set` does this). Logs: `/media/developer/ambilight/`
+(`ambilight.log`, rotated at 512 KB; `supervise.log`); live state:
+`status.json` (every 2 s).
 
 ## Autostart and emergency brakes
 
@@ -81,7 +102,7 @@ To recover after a guard tripped: read the reason with `ambilightctl status`, th
 | Path | What |
 | --- | --- |
 | `/media/developer/apps/usr/palm/{applications,services,packages}/io.github.dimi3h.ambilight*` | the package (developer installer) |
-| `/media/developer/ambilight/` | logs, options, guard state, PicCap config backup |
+| `/media/developer/ambilight/` | logs, settings (`args`), live state (`status.json`), guard state, PicCap config backup |
 | `/var/lib/webosbrew/init.d/70-ambilight` | boot hook (symlink) |
 | `/var/luna-service2-dev/…/io.github.dimi3h.ambilight*` | Luna role/permission files, written by the installer and Homebrew Channel's elevation |
 | `/var/luna/preferences/vt_devmode` | LG's developer gate for the histogram API; created only for the moment of opening the histogram and removed right after by a guard process |

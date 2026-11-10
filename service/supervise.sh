@@ -22,10 +22,10 @@ log() {
 fast=0
 while [ ! -e "$STATE/disable" ]; do
     started=$(date +%s)
-    args=$(cat "$STATE/args" 2>/dev/null)
-    log "starting service $args"
-    # shellcheck disable=SC2086 # args is a deliberate word list
-    "$BIN" --log "$STATE/ambilight.log" $args < /dev/null > /dev/null 2>&1 9>&- &
+    log "starting service ($(cat "$STATE/args" 2> /dev/null))"
+    # settings come from $STATE/args; ambilightctl set rewrites it and sends SIGUSR1 to reload
+    "$BIN" --log "$STATE/ambilight.log" --args-file "$STATE/args" --status-file "$STATE/status.json" \
+        < /dev/null > /dev/null 2>&1 9>&- &
     pid=$!
     echo "$pid" > "$STATE/service.pid"
     # running for 60 s counts as a stable boot: reset the boot-loop guard
