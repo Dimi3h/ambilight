@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """End-to-end check: compare HyperHDR's actual LED output with the ideal per-LED colours.
 
-usage: validate_live.py <calib-dump.txt> <ledrec.jsonl> <leds.json>
+usage: validate_live.py <calib-dump.txt> <ledrec.jsonl> <leds.json> [--stretch]
 
 Run app/validate.html on the TV while the service runs with --calib-dump (UI ground
 truth) and tools/ledrec.py records HyperHDR's LED stream. Each image shown for >= 1.5 s
@@ -10,7 +10,7 @@ the report lists the uniform references and the mean absolute error per validati
 image against what an ideal per-LED grabber would show. Add --no-ui-blend to the
 service to test the histogram reconstruction alone (otherwise opaque UI dominates).
 """
-import json, sys, socket, importlib.util, os
+import json, sys, socket, importlib.util, os, gzip
 spec = importlib.util.spec_from_file_location("cal", os.path.join(os.path.dirname(os.path.abspath(__file__)), "calibrate.py"))
 cal = importlib.util.module_from_spec(spec); spec.loader.exec_module(cal)
 DUMP, REC, LEDS = sys.argv[1:4]
@@ -24,7 +24,7 @@ for (t, f), (t2, _) in zip(U, U[1:] + [(U[-1][0] + 99999, None)]):
         seq.append(f)
 print("ground-truth frames (>=1.5 s):", len(seq))
 # LED plateaus from the HyperHDR stream
-rec = [json.loads(l) for l in open(REC)]
+rec = [json.loads(l) for l in (gzip.open(REC, "rt") if REC.endswith(".gz") else open(REC))]
 frames = [r[1] for r in rec]
 segs, cur = [], []
 for a, b in zip(frames, frames[1:]):
@@ -40,9 +40,24 @@ def seg_leds(sg):
 plateaus = [seg_leds(sg) for sg in segs]
 print("LED plateaus (>=0.8 s):", len(plateaus))
 # ideal per-LED colours of each ground-truth frame
+STRETCH = "--stretch" in sys.argv  # target: bars cropped, picture stretched (letterbox)
+def bars(f):
+    dark = lambda y: max(max(c[:3]) for c in f[y]) < 10
+    t = 0
+    while t < len(f) // 2 and dark(t): t += 1
+    b = 0
+    while b < len(f) // 2 and dark(len(f) - 1 - b): b += 1
+    return (t, b) if (t and b) else (0, 0)
 def gt(f):
-    img = [list(f[y][x][:3]) for y in range(18) for x in range(32)]
-    return [cal.rect_mean(img, 32, 18, l) for l in leds]
+    w, h = len(f[0]), len(f)
+    img = [list(f[y][x][:3]) for y in range(h) for x in range(w)]
+    if STRETCH:
+        t, b = bars(f)
+        if t or b:
+            spec2 = importlib.util.spec_from_file_location("lbx", os.path.join(os.path.dirname(os.path.abspath(__file__)), "letterbox.py"))
+            lbx = importlib.util.module_from_spec(spec2); spec2.loader.exec_module(lbx)
+            img = lbx.stretch(img, w, h, t / h, b / h, w, h)
+    return [cal.rect_mean(img, w, h, l) for l in leds]
 gts = [gt(f) for f in seq]
 uni = lambda f: all(abs(c[k] - f[0][0][k]) <= 4 for row in f for c in row for k in range(3))
 # optimal monotonic alignment (DP): match plateaus to ground-truth frames in order,

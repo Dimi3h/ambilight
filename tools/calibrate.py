@@ -20,6 +20,7 @@ Steps:
 Pure Python (no numpy); the linear systems are small.
 """
 import bisect
+import gzip
 import json
 import math
 import struct
@@ -34,17 +35,19 @@ NZ = 16
 
 # ------------------------------------------------------------------ parsing
 def load(path):
+    opener = gzip.open if path.endswith(".gz") else open
     H, U = [], []
-    for line in open(path):
+    for line in opener(path, "rt"):
         p = line.split()
         if not p:
             continue
         if p[0] == "H" and len(p) == 2 + 48:
             v = list(map(float, p[2:]))
             H.append((int(p[1]), [v[3 * z:3 * z + 3] for z in range(NZ)]))
-        elif p[0] == "U" and len(p) == 2 + UW * UH:
+        elif p[0] == "U" and len(p) - 2 in (32 * 18, 64 * 36):
+            w = 32 if len(p) - 2 == 32 * 18 else 64
             cells = [tuple(map(int, c.split(","))) for c in p[2:]]
-            U.append((int(p[1]), [cells[y * UW:(y + 1) * UW] for y in range(UH)]))
+            U.append((int(p[1]), [cells[y * w:(y + 1) * w] for y in range(len(cells) // w)]))
     return H, U
 
 

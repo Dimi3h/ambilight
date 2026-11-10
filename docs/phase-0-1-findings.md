@@ -226,7 +226,7 @@ stopped on the TV, PicCap restored.
 
 ### Step 3 — zone calibration (done)
 
-New capture (`probe/data/2026-11-10/cal.txt`, 2.5 min on the TV) with the UI plane
+New capture (`probe/data/2026-11-10/cal.txt.gz`, 2.5 min on the TV) with the UI plane
 recorded as ground truth at 32x18 (`--calib-dump`) while `app/calibrate.html` showed
 references, a white cell walking a 16x9 grid, and 16 validation images.
 
@@ -275,3 +275,54 @@ Recalibrating (e.g. after a firmware update): install the IPK, copy
 `ambilight --calib-dump cal.txt` for ~140 s while launching the app, then
 `python3 tools/calibrate.py cal.txt leds.json src/profile_b4.h --preview out.png` and
 rebuild. `leds.json` is `serverinfo.info.leds` from HyperHDR.
+
+### Black bars (21:9) — done
+
+Capture `probe/data/2026-11-10/lb.txt.gz` (`app/letterbox.html`, `--calib-presets 0,1,2,3`,
+UI ground truth at 64x36, per-zone dark fractions). Analysis: `tools/letterbox.py`.
+
+What the histogram presets measure (walking-cell footprints):
+- preset 1: letterbox crop — top and bottom cell rows excluded (~11 % each);
+- preset 2: pillarbox crop (4:3) — left and right ~12 % excluded;
+- preset 3: a different 14-zone layout over nearly the whole frame.
+
+Detector (preset 0, continuous): a zone's share of pixels at or below 16 in every
+channel must cover the share the bars would take of that zone (from the footprints);
+the largest symmetric bar height (1–7 rows of 36) that every zone supports wins. On the
+11 test images it was exact at every threshold (4/8/16/24) — bars of 5, 4, 3, 2 rows, a
+dark letterboxed scene, and no false alarm on a 16:9 image with a dark top band. In the
+service a level is adopted after 2 s; nothing changes while the picture centre is black
+(fades), and an opaque UI covering > 50 % (menus) means "no bars".
+
+Strategies (MAE vs the bar-cropped, stretched picture at the LED rectangles, mean over
+the 8 letterboxed images):
+
+| strategy | MAE |
+| --- | --- |
+| no handling (previous) | 53.8 |
+| crop and stretch only | 38.8 |
+| **preset 0 + bar model** (bars as known black, per-level LS operator) | **22.3** |
+| preset 1 (TV letterbox crop) | 25.9 |
+
+The bar model wins and needs no preset switching or probe frames: `src/letterbox_b4.h`
+holds one operator per bar level plus each zone's bar share; the service subtracts the
+bars' black contribution, reconstructs, composites the UI in screen coordinates, then
+crops the bars and stretches the picture (so subtitles inside the bars don't reach the
+LEDs). The C output equals the Python model exactly (0/255 on all 11 images).
+
+Live on the TV:
+- test images, LED stream recorded: switches 0→5→4→3→2→5(dark scene)→0, each ~2 s after
+  the change; letterboxed MAE **22.1** (offline 22.3); 16:9 images unchanged.
+- a real 2.39:1 film on Disney+ (protected/SVP): histogram stayed open from the menu into
+  the film (`holds=0`), bars detected as 5 rows; top/bottom LEDs now track the picture
+  (mean 22 / 27 vs 24 / 17 left/right on a dark scene) instead of the bars' black.
+- found and fixed: the service now ignores SIGHUP (it died when the SSH session that
+  started it closed). The dark Disney+ menu briefly read as 1-row bars; fixed by the
+  opaque-UI rule.
+
+Recalibrating letterbox handling: show `app/letterbox.html`, run
+`ambilight --calib-presets 0,1,2,3 --calib-dump lb.txt` for ~245 s, then
+`python3 tools/letterbox.py lb.txt cal.txt leds.json src/profile_b4.h --emit src/letterbox_b4.h`.
+Live check: `app/letterbox-validate.html` + `tools/ledrec.py` +
+`tools/validate_live.py <dump> <ledrec> leds.json --stretch` (run the service with
+`--no-ui-blend`, otherwise the opaque test images come from the UI plane).
