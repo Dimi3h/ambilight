@@ -25,7 +25,8 @@ Measurements behind every design decision: `docs/phase-0-1-findings.md`.
 
 Requirements: rooted TV with Homebrew Channel, HyperHDR reachable on the network.
 
-1. In Homebrew Channel open **Settings → Extra repositories** and add
+1. In Homebrew Channel open **Settings**, choose **Add repository** under **Repositories**
+   and enter
    ```text
    https://github.com/Dimi3h/ambilight/releases/latest/download/repo.json
    ```
