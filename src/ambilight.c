@@ -21,6 +21,7 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -52,6 +53,7 @@ static int g_interval_ms = 50;    // 20 Hz
 static int g_duration_ms = 1000;  // image expiry if the service stops feeding
 static double g_gain = 1.0;       // overall brightness gain before HyperHDR's own adjustment
 static int g_ui_cap_w = 320, g_ui_cap_h = 180;
+static bool g_ui_blend = true;     // --no-ui-blend: histogram reconstruction only (diagnostics)
 
 // Re-acquire pacing after the histogram is lost (e.g. LG's captureservice grabbing it on
 // an app switch). For the first FAST window we retry every loop so we catch the brief
@@ -60,8 +62,9 @@ static int g_ui_cap_w = 320, g_ui_cap_h = 180;
 #define FAST_REACQUIRE_MS 4000
 #define SLOW_PROBE_MS 3000
 
-#define GRID_W PROFILE_COLS
-#define GRID_H PROFILE_ROWS
+// Output image sent to HyperHDR: the reconstruction grid, optionally upsampled 2x.
+#define GRID_W (PROFILE_COLS * (PROFILE_UPSAMPLE ? 2 : 1))
+#define GRID_H (PROFILE_ROWS * (PROFILE_UPSAMPLE ? 2 : 1))
 
 // ---------------------------------------------------------------- utilities
 
@@ -374,19 +377,30 @@ static void hist_close(void)
     if (g_hist) { h_fini(g_hist); g_hist = NULL; }
 }
 
+// Exact (unrounded) zone means of the last successful read, for calibration dumps.
+static double g_zf[16][3];
+
+static double mean_bin_f(const uint16_t* bins)
+{
+    uint64_t c = 0, w = 0;
+    for (int b = 0; b < 256; b++) {
+        c += bins[b];
+        w += (uint64_t)bins[b] * b;
+    }
+    return c ? (double)w / (double)c : 0.0;
+}
+
 // Read 16 zones into zrgb[16][3]; returns true on success.
 static bool hist_read(uint8_t zrgb[16][3])
 {
     hist_rec_t buf[16];
     if (!g_hist || h_get(g_hist, buf) != 0) return false;
-    bool any = false;
-    for (int i = 0; i < 16; i++) {
-        zrgb[i][0] = mean_bin(buf[i].bins[0]);
-        zrgb[i][1] = mean_bin(buf[i].bins[1]);
-        zrgb[i][2] = mean_bin(buf[i].bins[2]);
-        if (zrgb[i][0] | zrgb[i][1] | zrgb[i][2]) any = true;
-    }
-    return any || true; // all-black is still a valid reading
+    for (int i = 0; i < 16; i++)
+        for (int c = 0; c < 3; c++) {
+            g_zf[i][c] = mean_bin_f(buf[i].bins[c]);
+            zrgb[i][c] = mean_bin(buf[i].bins[c]);
+        }
+    return true; // all-black is still a valid reading
 }
 
 // ---------------------------------------------------------------- UI plane (halgal)
@@ -456,19 +470,117 @@ static bool ui_read(uint8_t urgb[GRID_H][GRID_W][3], uint8_t ualpha[GRID_H][GRID
     return true;
 }
 
+// ---------------------------------------------------------------- calibration dump (developer tool)
+//
+// --calib-dump <file> appends, per loop, the exact zone means ("H" lines) and, whenever
+// the UI plane changes, a 32x18 RGBA grid of it ("U" lines) as ground truth. Showing a
+// known pattern on the UI plane (opaque, no video) lets tools/calibrate.py derive the
+// zone footprints and evaluate reconstruction methods offline.
+
+static FILE* g_calib;
+#define CAL_W 32
+#define CAL_H 18
+
+static void calib_dump_hist(uint64_t t)
+{
+    fprintf(g_calib, "H %llu", (unsigned long long)t);
+    for (int i = 0; i < 16; i++)
+        fprintf(g_calib, " %.2f %.2f %.2f", g_zf[i][0], g_zf[i][1], g_zf[i][2]);
+    fputc('\n', g_calib);
+}
+
+// Uses the surface captured by the preceding ui_read(); no extra capture.
+static void calib_dump_ui(uint64_t t)
+{
+    static uint8_t prev[CAL_H][CAL_W][4];
+    static bool have_prev;
+    uint8_t cur[CAL_H][CAL_W][4];
+    int W = g_surf.width, H = g_surf.height, pitch = g_surf.pitch;
+    bool changed = !have_prev;
+    for (int gy = 0; gy < CAL_H; gy++)
+        for (int gx = 0; gx < CAL_W; gx++) {
+            uint32_t s[4] = { 0 }, n = 0;
+            for (int y = gy * H / CAL_H; y < (gy + 1) * H / CAL_H; y++)
+                for (int x = gx * W / CAL_W; x < (gx + 1) * W / CAL_W; x++) {
+                    const uint8_t* p = g_uimem + (size_t)y * pitch + (size_t)x * 4;
+                    s[0] += p[2]; s[1] += p[1]; s[2] += p[0]; s[3] += p[3]; // B,G,R,A in memory
+                    n++;
+                }
+            for (int c = 0; c < 4; c++) {
+                cur[gy][gx][c] = n ? (uint8_t)(s[c] / n) : 0;
+                if (have_prev && abs((int)cur[gy][gx][c] - (int)prev[gy][gx][c]) > 2) changed = true;
+            }
+        }
+    if (!changed) return;
+    memcpy(prev, cur, sizeof(prev));
+    have_prev = true;
+    fprintf(g_calib, "U %llu", (unsigned long long)t);
+    for (int gy = 0; gy < CAL_H; gy++)
+        for (int gx = 0; gx < CAL_W; gx++)
+            fprintf(g_calib, " %u,%u,%u,%u", cur[gy][gx][0], cur[gy][gx][1], cur[gy][gx][2], cur[gy][gx][3]);
+    fputc('\n', g_calib);
+}
+
 // ---------------------------------------------------------------- compose
 
 static uint8_t clamp8(double v) { return v < 0 ? 0 : v > 255 ? 255 : (uint8_t)(v + 0.5); }
 
-// Build the grid image: each cell = its profile zone colour, with the UI composited on
-// top by its alpha. out is GRID_H*GRID_W*3 row-major RGB.
-static void compose(const uint8_t zrgb[16][3], const uint8_t urgb[GRID_H][GRID_W][3],
+// Raw histogram value -> 0..255 for output channel c, using the measured levels
+// (removes the picture mode's white-balance tint and black lift).
+static double level_map(double raw, int c)
+{
+    double f = (raw - PROFILE_BLACK[c]) / (PROFILE_WHITE[c] - PROFILE_BLACK[c]);
+    if (f <= 0) return 0;
+    if (f >= 1) return 255;
+    return 255.0 * pow(f, 1.0 / PROFILE_GAMMA[c]);
+}
+
+// Reconstruct the colour of every profile cell from the 16 zone means. The histogram is
+// a linear average over each zone's footprint, so the reconstruction is linear in the
+// raw domain (PROFILE_R, see tools/calibrate.py); the level map is applied afterwards.
+static void reconstruct(const double zm[16][3], double out[GRID_H][GRID_W][3])
+{
+    static double cell[PROFILE_ROWS][PROFILE_COLS][3];
+    for (int k = 0; k < PROFILE_ROWS * PROFILE_COLS; k++)
+        for (int c = 0; c < 3; c++) {
+            double raw = 0;
+            for (int z = 0; z < 16; z++) raw += PROFILE_R[k][z] * zm[z][PROFILE_PERM[c]];
+            cell[k / PROFILE_COLS][k % PROFILE_COLS][c] = level_map(raw, c) * g_gain;
+        }
+#if PROFILE_UPSAMPLE
+    // bilinear 2x, pixel-centre aligned (the same resampling the calibration evaluated)
+    for (int Y = 0; Y < GRID_H; Y++) {
+        double fy = (Y + 0.5) / 2 - 0.5;
+        if (fy < 0) fy = 0;
+        if (fy > PROFILE_ROWS - 1) fy = PROFILE_ROWS - 1;
+        int y0 = (int)fy, y1 = y0 + 1 < PROFILE_ROWS ? y0 + 1 : y0;
+        double v = fy - y0;
+        for (int X = 0; X < GRID_W; X++) {
+            double fx = (X + 0.5) / 2 - 0.5;
+            if (fx < 0) fx = 0;
+            if (fx > PROFILE_COLS - 1) fx = PROFILE_COLS - 1;
+            int x0 = (int)fx, x1 = x0 + 1 < PROFILE_COLS ? x0 + 1 : x0;
+            double u = fx - x0;
+            for (int c = 0; c < 3; c++)
+                out[Y][X][c] = (cell[y0][x0][c] * (1 - u) + cell[y0][x1][c] * u) * (1 - v)
+                    + (cell[y1][x0][c] * (1 - u) + cell[y1][x1][c] * u) * v;
+        }
+    }
+#else
+    memcpy(out, cell, sizeof(cell));
+#endif
+}
+
+// Build the output image: reconstructed colours with the UI plane composited on top by
+// its alpha. out is GRID_H*GRID_W*3 row-major RGB.
+static void compose(const double zm[16][3], const uint8_t urgb[GRID_H][GRID_W][3],
     const uint8_t ualpha[GRID_H][GRID_W], bool have_ui, uint8_t* out)
 {
+    static double base[GRID_H][GRID_W][3];
+    reconstruct(zm, base);
     for (int r = 0; r < GRID_H; r++)
         for (int c = 0; c < GRID_W; c++) {
-            int z = PROFILE_CELL_ZONE[r][c];
-            double br = zrgb[z][0] * g_gain, bg = zrgb[z][1] * g_gain, bb = zrgb[z][2] * g_gain;
+            double br = base[r][c][0], bg = base[r][c][1], bb = base[r][c][2];
             if (have_ui) {
                 double a = ualpha[r][c] / 255.0;
                 br = urgb[r][c][0] * a + br * (1 - a);
@@ -491,6 +603,11 @@ int main(int argc, char** argv)
         else if (!strcmp(argv[i], "--priority") && i + 1 < argc) g_priority = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--interval") && i + 1 < argc) g_interval_ms = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--gain") && i + 1 < argc) g_gain = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--no-ui-blend")) g_ui_blend = false;
+        else if (!strcmp(argv[i], "--calib-dump") && i + 1 < argc) {
+            g_calib = fopen(argv[++i], "w");
+            if (g_calib) setvbuf(g_calib, NULL, _IOFBF, 1 << 16);
+        }
     }
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
@@ -499,7 +616,9 @@ int main(int argc, char** argv)
     if (!hist_load()) { logmsg("histogram API unavailable"); return 2; }
     if (!ui_open()) logmsg("UI plane unavailable; continuing with histogram only");
 
-    uint8_t zrgb[16][3] = { { 0 } };     // last good zone colours (held across gaps)
+    static double zhold[16][3];          // zone means used for output (held across gaps)
+    static double zprev[16][3];          // previous raw read, for the 2-read average
+    bool prev_ok = false;
     bool have_colour = false;
     uint64_t down_since = now_ms();      // we start without a handle; 0 once we hold one
     uint64_t next_open_try = 0;
@@ -532,22 +651,34 @@ int main(int argc, char** argv)
         uint8_t z[16][3];
         bool got = g_hist && hist_read(z);
         if (got) {
-            memcpy(zrgb, z, sizeof(zrgb));
+            // Average with the previous read: consecutive reads alternate between two
+            // buffers on moving video; averaging halves the resulting jitter (measured).
+            for (int i = 0; i < 16; i++)
+                for (int c = 0; c < 3; c++) {
+                    zhold[i][c] = prev_ok ? (g_zf[i][c] + zprev[i][c]) / 2 : g_zf[i][c];
+                    zprev[i][c] = g_zf[i][c];
+                }
+            prev_ok = true;
             have_colour = true;
+            if (g_calib) calib_dump_hist(t);
         } else if (g_hist) {
             // handle was revoked mid-stream: drop it and start re-acquiring at once
             hist_close();
             down_since = t;
             next_open_try = t; // first retry immediately (fast window)
         }
-        if (!got) holds++;
+        if (!got) {
+            holds++;
+            prev_ok = false; // never average across a gap
+        }
 
         if (have_colour) {
             static uint8_t urgb[GRID_H][GRID_W][3];
             static uint8_t ua[GRID_H][GRID_W];
             bool have_ui = g_ui_ok && ui_read(urgb, ua);
+            if (g_calib && have_ui) calib_dump_ui(t);
             static uint8_t img[GRID_H * GRID_W * 3];
-            compose(zrgb, urgb, ua, have_ui, img);
+            compose(zhold, urgb, ua, have_ui && g_ui_blend, img);
             if (hh_send_image(img, GRID_W, GRID_H)) frames++;
         }
 
@@ -568,6 +699,7 @@ int main(int argc, char** argv)
     }
 
     logmsg("shutting down");
+    if (g_calib) fclose(g_calib);
     hh_clear();
     hh_close();
     hist_close();

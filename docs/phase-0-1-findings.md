@@ -223,3 +223,55 @@ Calibration refinement (step 3), settings app (step 5), autostart + failsafe + o
 IPK + README with full rollback (step 6, incl. disabling PicCap autostart), CPU
 optimisation. Nothing is committed yet; the probe package and this service are removed/
 stopped on the TV, PicCap restored.
+
+### Step 3 — zone calibration (done)
+
+New capture (`probe/data/2026-11-10/cal.txt`, 2.5 min on the TV) with the UI plane
+recorded as ground truth at 32x18 (`--calib-dump`) while `app/calibrate.html` showed
+references, a white cell walking a 16x9 grid, and 16 validation images.
+
+Measured:
+- Histogram channels are R,G,B (verified with pure red/green/blue fields; was assumed).
+  UI plane bytes are B,G,R,A as assumed.
+- The histogram is a **linear** mean: grey 64/128 give gamma 1.01, and every zone's
+  footprint fractions sum to ~1.0 (zone 1: 1.21). Black ≈ 0.8.
+- The picture mode's white balance is in the histogram: white = (253, 237, 205), i.e.
+  blue −20 %. The service now removes it (white → 255,255,255); HyperHDR's own LED
+  calibration sets the LED white. One-line change if the screen's tint should be kept.
+
+Reconstruction: instead of assigning each cell the strongest zone, solve
+`min ||A c − h||² + λ cᵀLc` (A = measured footprints, L = grid Laplacian), i.e. a
+fixed 144×16 operator `PROFILE_R` (src/profile_b4.h), applied in the raw domain and
+then level-mapped, upsampled 2× bilinearly to a 32x18 image. Mean absolute error at the
+210 HyperHDR LED rectangles on the 15 validation images (0..255):
+
+| method | MAE |
+| --- | --- |
+| whole-screen average | 38.2 |
+| hard assignment (previous) | 22.4 |
+| weighted average of zones | 22.0–24.4 |
+| **least squares, λ = 0.003, 2× upsample** | **17.7** |
+
+λ was chosen as the lowest-noise operator within 1 % of the best MAE. The operator has
+negative weights (worst-case row gain 8.8), but replaying 1562 real YouTube histogram
+reads showed **the same LED jitter as before** (0.89 vs 0.93 units read-to-read);
+averaging two consecutive reads (now in the service) halves it again (0.38).
+
+Live validation on the TV, HyperHDR LED stream recorded from the Mac
+(`tools/ledrec.py`, `tools/validate_live.py`):
+- With UI blending on (normal mode), the opaque validation images come straight from
+  the UI plane: MAE 3.1 — confirms orientation, edges and HyperHDR mapping, and means
+  full-screen menus/launchers get exact per-pixel colours.
+- With `--no-ui-blend` (histogram path only, as for video/DRM): references exact
+  (white 252, grey 128 → 127.6, primaries pure) and **MAE 17.8** on the 15 images —
+  matching the offline prediction (17.7).
+- Letterbox (21:9) image: MAE 33.6 — zones span bar and picture, so colour leaks into
+  the top/bottom LEDs. Needs black-border handling (open item).
+- CPU without the dump: **24 % of one core** (was 21 %), RSS 3.7 MB.
+- The C reconstruction equals the Python model to 0.0005/255.
+
+Recalibrating (e.g. after a firmware update): install the IPK, copy
+`app/calibrate.html` over the app's `index.html`, stop PicCap, run
+`ambilight --calib-dump cal.txt` for ~140 s while launching the app, then
+`python3 tools/calibrate.py cal.txt leds.json src/profile_b4.h --preview out.png` and
+rebuild. `leds.json` is `serverinfo.info.leds` from HyperHDR.

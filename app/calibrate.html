@@ -1,0 +1,115 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Ambilight calibration</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; background: #000; overflow: hidden; cursor: none; }
+  canvas { position: absolute; inset: 0; width: 100vw; height: 100vh; image-rendering: pixelated; }
+</style>
+</head>
+<body>
+<canvas id="c" width="64" height="36"></canvas>
+<script>
+// Zone-calibration pattern, shown on the UI plane while the service runs with
+// --calib-dump. The service also records the UI plane itself as ground truth, so the
+// exact timing below only has to be roughly right.
+//   25 s black lead-in (outlasts the launch splash and LG's post-launch capture grab)
+//   10 reference fields, 2 s each (white, black, greys, primaries, secondaries)
+//   white cell walking a 16x9 grid, 300 ms per cell
+//   16 validation images, 2 s each (smooth fields, splits, bars, object, letterbox)
+var SKIP_WALK = false; // validate.html: references + validation images only
+var W = 64, H = 36;
+var ctx = document.getElementById('c').getContext('2d');
+var img = ctx.createImageData(W, H);
+
+function rng(seed) { // mulberry32
+  return function () {
+    seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+    var t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+function fill(fn) {
+  for (var y = 0; y < H; y++) for (var x = 0; x < W; x++) {
+    var c = fn(x, y), i = (y * W + x) * 4;
+    img.data[i] = c[0]; img.data[i + 1] = c[1]; img.data[i + 2] = c[2]; img.data[i + 3] = 255;
+  }
+  ctx.putImageData(img, 0, 0);
+}
+function solid(r, g, b) { return function () { fill(function () { return [r, g, b]; }); }; }
+function randColour(R) { return [R() * 255 | 0, R() * 255 | 0, R() * 255 | 0]; }
+function smoothField(seed, gw, gh) { // bilinear interpolation of a random colour grid
+  return function () {
+    var R = rng(seed), g = [];
+    for (var j = 0; j <= gh; j++) { g.push([]); for (var i = 0; i <= gw; i++) g[j].push(randColour(R)); }
+    fill(function (x, y) {
+      var fx = x / (W - 1) * gw, fy = y / (H - 1) * gh;
+      var i = Math.min(gw - 1, fx | 0), j = Math.min(gh - 1, fy | 0), u = fx - i, v = fy - j, o = [];
+      for (var k = 0; k < 3; k++)
+        o.push((g[j][i][k] * (1 - u) + g[j][i + 1][k] * u) * (1 - v) + (g[j + 1][i][k] * (1 - u) + g[j + 1][i + 1][k] * u) * v);
+      return o;
+    });
+  };
+}
+function split(seed, vertical) {
+  return function () {
+    var R = rng(seed), a = randColour(R), b = randColour(R);
+    fill(function (x, y) { return (vertical ? x < W / 2 : y < H / 2) ? a : b; });
+  };
+}
+function bars(seed, n) {
+  return function () {
+    var R = rng(seed), cs = [];
+    for (var i = 0; i < n; i++) cs.push(randColour(R));
+    fill(function (x) { return cs[Math.min(n - 1, x * n / W | 0)]; });
+  };
+}
+function blob(seed) { // bright saturated object on a dark background
+  return function () {
+    var R = rng(seed), cx = 8 + R() * 48, cy = 6 + R() * 24, c = [255, R() * 128 | 0, 40];
+    fill(function (x, y) {
+      var d = ((x - cx) * (x - cx) + (y - cy) * (y - cy)) / 40, k = Math.exp(-d);
+      return [12 + c[0] * k, 12 + c[1] * k, 18 + c[2] * k];
+    });
+  };
+}
+function letterbox(seed) { // 2.39:1 picture with black bars (12.8 % top and bottom)
+  return function () {
+    smoothField(seed, 4, 2)();
+    var bar = Math.round(H * 0.128), d = ctx.getImageData(0, 0, W, H);
+    for (var y = 0; y < H; y++) if (y < bar || y >= H - bar)
+      for (var x = 0; x < W; x++) { var i = (y * W + x) * 4; d.data[i] = d.data[i + 1] = d.data[i + 2] = 0; }
+    ctx.putImageData(d, 0, 0);
+  };
+}
+function walkCell(k) {
+  return function () {
+    var cx = k % 16, cy = k / 16 | 0;
+    fill(function (x, y) { return ((x / 4 | 0) === cx && (y / 4 | 0) === cy) ? [255, 255, 255] : [0, 0, 0]; });
+  };
+}
+
+var seq = [{ d: 25000, f: solid(0, 0, 0) }];
+[[255, 255, 255], [0, 0, 0], [128, 128, 128], [64, 64, 64], [255, 0, 0], [0, 255, 0], [0, 0, 255],
+ [255, 255, 0], [0, 255, 255], [255, 0, 255]].forEach(function (c) { seq.push({ d: 2000, f: solid(c[0], c[1], c[2]) }); });
+if (!SKIP_WALK) for (var k = 0; k < 144; k++) seq.push({ d: 300, f: walkCell(k) });
+var val = [smoothField(11, 4, 3), smoothField(12, 3, 2), smoothField(13, 5, 3), smoothField(14, 4, 3),
+  smoothField(15, 2, 2), smoothField(16, 6, 4), smoothField(17, 4, 3), smoothField(18, 3, 3),
+  smoothField(19, 5, 4), smoothField(20, 4, 2), split(21, true), split(22, false), bars(23, 4),
+  blob(24), blob(25), letterbox(26)];
+val.forEach(function (f) { seq.push({ d: 2000, f: f }); });
+seq.push({ d: 60000, f: solid(0, 0, 0) });
+
+var t0 = performance.now(), cur = -1;
+function frame() {
+  var t = performance.now() - t0, acc = 0, idx = seq.length - 1;
+  for (var i = 0; i < seq.length; i++) { acc += seq[i].d; if (t < acc) { idx = i; break; } }
+  if (idx !== cur) { cur = idx; seq[idx].f(); }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

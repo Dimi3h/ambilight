@@ -16,7 +16,7 @@ CPU="cortex_a9"
 mkdir -p build
 echo "Compiling ambilight $VER for $TARGET..."
 zig cc -target "$TARGET" -mcpu="$CPU" -O2 -Wall -Wextra -rdynamic \
-    -o build/ambilight src/ambilight.c -ldl
+    -o build/ambilight src/ambilight.c -ldl -lm
 
 ST=build/stage
 rm -rf "$ST"
