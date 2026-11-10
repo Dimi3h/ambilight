@@ -1,0 +1,26 @@
+[17709.741] UI plane ready 320x180 pitch 1280
+[17709.741] ambilight starting: host 192.168.129.249:19444 priority 150 interval 50ms
+[17709.773] histogram opened
+[17709.794] HyperHDR connected 192.168.129.249:19444
+[17711.752] letterbox: bars 0 -> 1 rows of 36
+[17714.782] frames=101 holds=0 reopens=0 hist=open policy=0 maxgap=0ms totalgap=0ms
+[17719.795] frames=201 holds=0 reopens=0 hist=open policy=0 maxgap=0ms totalgap=0ms
+[17724.803] frames=301 holds=0 reopens=0 hist=open policy=0 maxgap=0ms totalgap=0ms
+[17729.846] frames=401 holds=0 reopens=0 hist=open policy=0 maxgap=0ms totalgap=0ms
+[17734.854] frames=495 holds=0 reopens=0 hist=open policy=0 maxgap=0ms totalgap=0ms
+[17739.859] frames=595 holds=0 reopens=0 hist=open policy=0 maxgap=0ms totalgap=0ms
+[17744.888] frames=695 holds=0 reopens=0 hist=open policy=0 maxgap=0ms totalgap=0ms
+[17749.915] frames=795 holds=0 reopens=0 hist=open policy=0 maxgap=0ms totalgap=0ms
+[17754.943] frames=895 holds=0 reopens=0 hist=open policy=0 maxgap=0ms totalgap=0ms
+[17759.951] frames=995 holds=0 reopens=0 hist=open policy=0 maxgap=0ms totalgap=0ms
+[17761.090] letterbox: bars 1 -> 5 rows of 36
+[17764.967] frames=1095 holds=0 reopens=0 hist=open policy=0 maxgap=0ms totalgap=0ms
+[17769.995] frames=1195 holds=0 reopens=0 hist=open policy=0 maxgap=0ms totalgap=0ms
+[17775.004] frames=1295 holds=0 reopens=0 hist=open policy=0 maxgap=0ms totalgap=0ms
+[17780.012] frames=1395 holds=0 reopens=0 hist=open policy=0 maxgap=0ms totalgap=0ms
+[17785.022] frames=1495 holds=0 reopens=0 hist=open policy=0 maxgap=0ms totalgap=0ms
+[17790.048] frames=1594 holds=0 reopens=0 hist=open policy=0 maxgap=0ms totalgap=0ms
+[17795.055] frames=1694 holds=0 reopens=0 hist=open policy=0 maxgap=0ms totalgap=0ms
+[17800.097] frames=1794 holds=0 reopens=0 hist=open policy=0 maxgap=0ms totalgap=0ms
+[17805.129] frames=1894 holds=0 reopens=0 hist=open policy=0 maxgap=0ms totalgap=0ms
+[17810.134] frames=1994 holds=0 reopens=0 hist=open policy=0 maxgap=0ms totalgap=0ms

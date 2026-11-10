@@ -1,0 +1,232 @@
+#!/bin/sh
+# ambilightctl - control the ambilight service on the TV (also used by the settings app
+# through Homebrew Channel's exec).
+#   start              clear the disable and pause flags and the boot-loop counter, start now
+#   stop               write the disable flag (persists across reboots), stop the service
+#   restart            stop, then start
+#   pause | resume     LEDs off/on while the service keeps running (persists; the blue
+#   toggle             remote key does the same when bluekey=on)
+#   status             human-readable state, disable reason, recent log lines
+#   json-status        the same as one JSON object (for the settings app)
+#   set key=value ...  change settings and apply them without a restart; keys:
+#                      host, port (1-65535), priority (1-253), gain (0.1-3.0),
+#                      letterbox (on|off), uiblend (on|off), bluekey (on|off: the remote's
+#                      blue key toggles ambilight). Prints {"ok":...}.
+#   setup              first run after an install from Homebrew Channel: elevate the
+#                      service, add the boot hook, start
+#   elevate            (re)grant the service its permissions through Homebrew Channel
+#   check-update       read the release feed now; prints the update info as JSON
+#   maintain           periodic upkeep (run by the service): daily update check
+SVC_DIR=/media/developer/apps/usr/palm/services/io.github.dimi3h.ambilight.service
+SVC=io.github.dimi3h.ambilight.service
+APP=io.github.dimi3h.ambilight
+STATE=/media/developer/ambilight
+HOOK=/var/lib/webosbrew/init.d/70-ambilight
+HB_ELEVATE=/media/developer/apps/usr/palm/services/org.webosbrew.hbchannel.service/elevate-service
+FEED_URL=https://github.com/Dimi3h/ambilight/releases/latest/download/repo.json
+BLUE_KEY=401 # KEY_BLUE on LG's Magic Remote (measured: evdev, lginput2 logs; the TV ignores it)
+mkdir -p "$STATE"
+
+running() { pidof ambilight > /dev/null 2>&1; }
+log() { echo "$(date '+%F %T') ctl: $*" >> "$STATE/supervise.log"; }
+signal_service() {
+    pid=$(cat "$STATE/service.pid" 2> /dev/null)
+    if [ -n "$pid" ] && running; then kill -USR1 "$pid" 2> /dev/null; fi
+}
+toast() {
+    luna-send -n 1 -a "$APP" luna://com.webos.notification/createToast \
+        "{\"sourceId\":\"$APP\",\"message\":\"$1\"}" > /dev/null 2>&1 &
+}
+
+stop() {
+    echo "$(date '+%F %T') stopped by ambilightctl" > "$STATE/disable"
+    sync
+    pid=$(cat "$STATE/service.pid" 2> /dev/null)
+    [ -n "$pid" ] && kill "$pid" 2> /dev/null # SIGTERM: the service clears its HyperHDR priority
+    i=0
+    while running && [ $i -lt 30 ]; do sleep 0.2; i=$((i + 1)); done
+    running && pkill -9 -f "$SVC_DIR/ambilight"
+    pkill -f "$SVC_DIR/supervise.sh" 2> /dev/null
+    echo "stopped"
+}
+
+start() {
+    rm -f "$STATE/disable" "$STATE/paused"
+    echo 0 > "$STATE/boot-attempts"
+    sync
+    signal_service # a running (paused) service resumes
+    setsid "$SVC_DIR/supervise.sh" now < /dev/null > /dev/null 2>&1 & # exits at once if one runs
+    sleep 1
+}
+
+pause() { echo "$(date '+%F %T') paused by ambilightctl" > "$STATE/paused"; sync; signal_service; echo paused; }
+resume() { rm -f "$STATE/paused"; sync; signal_service; echo resumed; }
+
+elevate() {
+    [ -x "$HB_ELEVATE" ] || { echo "Homebrew Channel's elevate-service not found" >&2; return 1; }
+    "$HB_ELEVATE" "$SVC" >> "$STATE/supervise.log" 2>&1
+}
+
+setup() {
+    elevate || echo "warning: elevation failed (see $STATE/supervise.log)"
+    mkdir -p /var/lib/webosbrew/init.d && ln -sfn "$SVC_DIR/autostart.sh" "$HOOK"
+    log "setup: boot hook added"
+    start
+}
+
+status() {
+    if running; then echo "service:    running (pid $(pidof ambilight))"; else echo "service:    not running"; fi
+    if pgrep -f "$SVC_DIR/supervise.sh" > /dev/null 2>&1; then echo "supervisor: running"; else echo "supervisor: not running"; fi
+    if [ -L "$HOOK" ]; then echo "autostart:  hook installed"; else echo "autostart:  no hook"; fi
+    if [ -e "$STATE/disable" ]; then echo "disabled:   $(tail -n 1 "$STATE/disable")"; else echo "disabled:   no"; fi
+    if [ -e "$STATE/paused" ]; then echo "paused:     yes ($(cat "$STATE/paused"))"; else echo "paused:     no"; fi
+    echo "version:    $(cat "$SVC_DIR/VERSION" 2> /dev/null || echo unknown)"
+    echo "boot count: $(cat "$STATE/boot-attempts" 2> /dev/null || echo 0) (3 = boot-loop guard trips)"
+    if [ -f "$STATE/ambilight.log" ]; then
+        echo "--- last log lines"
+        tail -n 5 "$STATE/ambilight.log"
+    fi
+}
+
+# --- settings: read $STATE/args into variables (defaults first)
+read_settings() {
+    host=192.168.129.249 port=19444 priority=150 gain=1.0 letterbox=on uiblend=on bluekey=off
+    # shellcheck disable=SC2046 # word splitting of the args file is intended
+    set -- $(cat "$STATE/args" 2> /dev/null)
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --host) host=$2; shift ;;
+            --port) port=$2; shift ;;
+            --priority) priority=$2; shift ;;
+            --gain) gain=$2; shift ;;
+            --no-letterbox) letterbox=off ;;
+            --no-ui-blend) uiblend=off ;;
+            --toggle-key) bluekey=on; shift ;;
+        esac
+        shift
+    done
+}
+
+write_settings() {
+    line="--host $host --port $port --priority $priority --gain $gain"
+    [ "$letterbox" = off ] && line="$line --no-letterbox"
+    [ "$uiblend" = off ] && line="$line --no-ui-blend"
+    [ "$bluekey" = on ] && line="$line --toggle-key $BLUE_KEY"
+    echo "$line" > "$STATE/args.tmp" && mv "$STATE/args.tmp" "$STATE/args"
+    sync
+}
+
+fail() { printf '{"ok":false,"error":"%s"}\n' "$1"; exit 1; }
+
+set_settings() {
+    read_settings
+    for kv in "$@"; do
+        k=${kv%%=*}
+        v=${kv#*=}
+        case "$k" in
+            host)
+                case "$v" in '' | *[!A-Za-z0-9.-]*) fail "invalid host" ;; esac
+                [ ${#v} -le 63 ] || fail "invalid host"
+                host=$v ;;
+            port)
+                case "$v" in '' | *[!0-9]*) fail "invalid port" ;; esac
+                [ "$v" -ge 1 ] && [ "$v" -le 65535 ] || fail "invalid port"
+                port=$v ;;
+            priority)
+                case "$v" in '' | *[!0-9]*) fail "invalid priority" ;; esac
+                [ "$v" -ge 1 ] && [ "$v" -le 253 ] || fail "invalid priority"
+                priority=$v ;;
+            gain)
+                case "$v" in '' | *[!0-9.]* | *.*.*) fail "invalid gain" ;; esac
+                awk -v g="$v" 'BEGIN { exit !(g >= 0.1 && g <= 3.0) }' || fail "invalid gain"
+                gain=$v ;;
+            letterbox | uiblend | bluekey)
+                case "$v" in on | off) ;; *) fail "invalid $k" ;; esac
+                eval "$k=\$v" ;;
+            *) fail "unknown key" ;;
+        esac
+    done
+    write_settings
+    signal_service
+    echo '{"ok":true}'
+}
+
+# --- updates: read the release feed (the same repo.json Homebrew Channel uses)
+check_update() {
+    cur=$(cat "$SVC_DIR/VERSION" 2> /dev/null || echo 0.0.0)
+    if ! curl -fsSL --max-time 30 -o "$STATE/feed.json" "$FEED_URL" 2> "$STATE/update.err"; then
+        printf '{"ok":false,"error":"feed not reachable"}\n'
+        return 1
+    fi
+    out=$(node "$SVC_DIR/helper.js" feed "$STATE/feed.json" "$cur")
+    case "$out" in *'"latest"'*) ;; *) echo "$out"; return 1 ;; esac
+    echo "$out" > "$STATE/update.json.tmp" && mv "$STATE/update.json.tmp" "$STATE/update.json"
+    latest=$(echo "$out" | sed -n 's/.*"latest":"\([0-9.]*\)".*/\1/p')
+    case "$out" in
+        *'"newer":true'*)
+            if [ "$(cat "$STATE/update-notified" 2> /dev/null)" != "$latest" ]; then
+                echo "$latest" > "$STATE/update-notified"
+                log "update $latest available (installed $cur)"
+                toast "Ambilight $latest is beschikbaar. Open de Ambilight-app om bij te werken."
+            fi ;;
+    esac
+    echo "$out"
+}
+
+maintain() {
+    last=$(date -r "$STATE/update.json" +%s 2> /dev/null || echo 0)
+    if [ $(($(date +%s) - last)) -ge 72000 ]; then check_update > /dev/null 2>&1; fi
+    return 0
+}
+
+# JSON string from stdin: escape backslash and quote, drop control characters
+jstr() { tr -d '\000-\037' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+jbool() { if "$@" > /dev/null 2>&1; then echo true; else echo false; fi; }
+
+json_status() {
+    read_settings
+    r=$(jbool running)
+    sv=$(jbool pgrep -f "$SVC_DIR/supervise.sh")
+    hook=$(jbool test -L "$HOOK")
+    paused=$(jbool test -e "$STATE/paused")
+    if [ -e "$STATE/disable" ]; then dis="\"$(tail -n 1 "$STATE/disable" | jstr)\""; else dis=null; fi
+    bc=$(cat "$STATE/boot-attempts" 2> /dev/null)
+    case "$bc" in '' | *[!0-9]*) bc=0 ;; esac
+    ver=$(cat "$SVC_DIR/VERSION" 2> /dev/null | tr -cd '0-9.')
+    st=null
+    if [ "$r" = true ] && [ -f "$STATE/status.json" ]; then
+        st=$(cat "$STATE/status.json")
+        # stale status (service hung) after 10 s
+        t=$(echo "$st" | sed -n 's/.*"t":\([0-9]*\).*/\1/p')
+        [ -n "$t" ] && [ $(($(date +%s) - t)) -gt 10 ] && st=null
+    fi
+    upd=null
+    [ -f "$STATE/update.json" ] && upd=$(cat "$STATE/update.json")
+    logl=""
+    if [ -f "$STATE/ambilight.log" ]; then
+        logl=$(tail -n 4 "$STATE/ambilight.log" | while IFS= read -r l; do printf '"%s",' "$(printf '%s' "$l" | jstr)"; done)
+    fi
+    printf '{"running":%s,"supervisor":%s,"autostart":%s,"paused":%s,"disabled":%s,"boot_count":%s,"version":"%s",' \
+        "$r" "$sv" "$hook" "$paused" "$dis" "$bc" "$ver"
+    printf '"settings":{"host":"%s","port":%s,"priority":%s,"gain":%s,"letterbox":%s,"ui_blend":%s,"bluekey":%s},' \
+        "$host" "$port" "$priority" "$gain" "$([ "$letterbox" = on ] && echo true || echo false)" \
+        "$([ "$uiblend" = on ] && echo true || echo false)" "$([ "$bluekey" = on ] && echo true || echo false)"
+    printf '"update":%s,"status":%s,"log":[%s]}\n' "$upd" "$st" "${logl%,}"
+}
+
+case "$1" in
+    start) start && status ;;
+    stop) stop ;;
+    restart) stop && start && status ;;
+    pause) pause ;;
+    resume) resume ;;
+    toggle) if [ -e "$STATE/paused" ]; then resume; else pause; fi ;;
+    status | "") status ;;
+    json-status) json_status ;;
+    set) shift; set_settings "$@" ;;
+    setup) setup && status ;;
+    elevate) elevate && echo elevated ;;
+    check-update) check_update ;;
+    maintain) maintain ;;
+    *) echo "usage: $0 start|stop|restart|pause|resume|toggle|status|json-status|set key=value...|setup|elevate|check-update|maintain" >&2; exit 2 ;;
+esac

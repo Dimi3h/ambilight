@@ -1,0 +1,33 @@
+# Build check for pushes and pull requests (publishing happens in release.yml).
+name: CI
+
+on:
+  push:
+    branches: ['**']
+    tags-ignore: ['**']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+      - name: Unit tests
+        run: sh tests/run.sh
+      - name: Build IPK
+        run: sh build.sh
+      - name: Shell syntax
+        run: for f in service/*.sh service/ambilightctl tools/*.sh build.sh; do sh -n "$f"; done
+      - name: Feed (dry run)
+        run: |
+          v=$(cat VERSION)
+          python3 -I tools/make_feed.py --version "$v" --ipk "build/io.github.dimi3h.ambilight_${v}_arm.ipk" \
+            --icon build/icon-256.png --out dist
+          node -e 'JSON.parse(require("fs").readFileSync("dist/repo.json","utf8"))'

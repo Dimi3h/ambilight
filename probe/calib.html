@@ -1,0 +1,42 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Ambilight zone calibration</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; background: #000; overflow: hidden; cursor: none; }
+  #patch { position: absolute; background: #fff; display: none; }
+  #full { position: absolute; inset: 0; background: #fff; display: none; }
+</style>
+</head>
+<body>
+<div id="full"></div>
+<div id="patch"></div>
+<script>
+// Phase 1 zone-mapping pattern (probe only).
+// t=0..12000 ms black (outlasts the launch splash); 12000..14000 full white (sync);
+// 14000..15000 black;
+// then a white cell walks a 16x9 grid row by row, 300 ms per cell; then black.
+var COLS = 16, ROWS = 9, CELL_MS = 300, START = 15000;
+var full = document.getElementById('full'), patch = document.getElementById('patch');
+var t0 = performance.now();
+function frame() {
+  var t = performance.now() - t0;
+  full.style.display = (t >= 12000 && t < 14000) ? 'block' : 'none';
+  var k = Math.floor((t - START) / CELL_MS);
+  if (t >= START && k < COLS * ROWS) {
+    var w = window.innerWidth / COLS, h = window.innerHeight / ROWS;
+    patch.style.left = (k % COLS) * w + 'px';
+    patch.style.top = Math.floor(k / COLS) * h + 'px';
+    patch.style.width = Math.ceil(w) + 'px';
+    patch.style.height = Math.ceil(h) + 'px';
+    patch.style.display = 'block';
+  } else {
+    patch.style.display = 'none';
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

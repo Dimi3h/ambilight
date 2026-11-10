@@ -1,0 +1,111 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Ambilight letterbox calibration</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; background: #000; overflow: hidden; cursor: none; }
+  canvas { position: absolute; inset: 0; width: 100vw; height: 100vh; image-rendering: pixelated; }
+</style>
+</head>
+<body>
+<canvas id="c" width="64" height="36"></canvas>
+<script>
+// Letterbox / preset calibration, shown while the service runs with
+//   --calib-dump <file> --calib-presets 0,1,2,3
+// A fully white frame marks the start of each cycle; the service then switches to the
+// next histogram preset. The service records the UI plane (64x36, same grid as this
+// canvas) as ground truth, so timing only has to be roughly right.
+//   25 s black lead-in                                   (preset 0)
+//   cycle 0: letterbox set                               (preset 0)
+//   cycle 1: marker, black/white refs, walking cell, letterbox set   (preset 1)
+//   cycle 2: marker, refs, walking cell                  (preset 2)
+//   cycle 3: marker, refs, walking cell                  (preset 3)
+var W = 64, H = 36;
+var ctx = document.getElementById('c').getContext('2d');
+var img = ctx.createImageData(W, H);
+
+function rng(seed) { // mulberry32
+  return function () {
+    seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+    var t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+function randColour(R) { return [R() * 255 | 0, R() * 255 | 0, R() * 255 | 0]; }
+function field(seed, gw, gh) { // bilinear interpolation of a random colour grid -> fn(x, y)
+  var R = rng(seed), g = [];
+  for (var j = 0; j <= gh; j++) { g.push([]); for (var i = 0; i <= gw; i++) g[j].push(randColour(R)); }
+  return function (x, y) {
+    var fx = x / (W - 1) * gw, fy = y / (H - 1) * gh;
+    var i = Math.min(gw - 1, fx | 0), j = Math.min(gh - 1, fy | 0), u = fx - i, v = fy - j, o = [];
+    for (var k = 0; k < 3; k++)
+      o.push((g[j][i][k] * (1 - u) + g[j][i + 1][k] * u) * (1 - v) + (g[j + 1][i][k] * (1 - u) + g[j + 1][i + 1][k] * u) * v);
+    return o;
+  };
+}
+function draw(fn) {
+  for (var y = 0; y < H; y++) for (var x = 0; x < W; x++) {
+    var c = fn(x, y), i = (y * W + x) * 4;
+    img.data[i] = c[0]; img.data[i + 1] = c[1]; img.data[i + 2] = c[2]; img.data[i + 3] = 255;
+  }
+  ctx.putImageData(img, 0, 0);
+}
+function solid(r, g, b) { return function () { draw(function () { return [r, g, b]; }); }; }
+// picture fn inside bars of `bar` rows at top and bottom (the picture is squeezed into
+// the active area, as a real letterboxed film would be)
+function boxed(fn, bar) {
+  return function () {
+    draw(function (x, y) {
+      if (y < bar || y >= H - bar) return [0, 0, 0];
+      var yy = (y - bar) * (H - 1) / Math.max(1, H - 1 - 2 * bar);
+      return fn(x, yy);
+    });
+  };
+}
+function scaled(fn, k) { return function (x, y) { var c = fn(x, y); return [c[0] * k, c[1] * k, c[2] * k]; }; }
+function brightTop(fn) { // picture whose top rows are bright and saturated
+  return function (x, y) { return y < 4 ? [255, 200 * (x / W), 40] : fn(x, y); };
+}
+function darkTop(fn) { // 16:9 picture with a very dark band at the top (night sky)
+  return function (x, y) { return y < 6 ? scaled(fn, 0.04)(x, y) : fn(x, y); };
+}
+function walkCell(k) {
+  return function () {
+    var cx = k % 16, cy = k / 16 | 0;
+    draw(function (x, y) { return ((x / 4 | 0) === cx && (y / 4 | 0) === cy) ? [255, 255, 255] : [0, 0, 0]; });
+  };
+}
+
+var LB = [boxed(field(31, 4, 3), 5), boxed(field(32, 4, 2), 5), boxed(field(33, 5, 3), 5),
+  boxed(field(34, 4, 3), 4), boxed(field(35, 3, 2), 3), boxed(field(36, 4, 3), 2),
+  boxed(scaled(field(37, 4, 3), 0.2), 5), boxed(brightTop(field(38, 4, 3)), 5),
+  boxed(field(39, 4, 3), 0), boxed(field(40, 5, 3), 0), boxed(darkTop(field(41, 4, 3)), 0)];
+
+var seq = [{ d: 25000, f: solid(0, 0, 0) }];
+function pushSet() { LB.forEach(function (f) { seq.push({ d: 2000, f: f }); }); }
+function pushMarkerRefs() {
+  seq.push({ d: 1500, f: solid(255, 255, 255) }); // cycle marker -> service switches preset
+  seq.push({ d: 1500, f: solid(0, 0, 0) });
+  seq.push({ d: 1500, f: solid(255, 255, 255) }); // white reference under the new preset
+  seq.push({ d: 1000, f: solid(0, 0, 0) });
+}
+function pushWalk() { for (var k = 0; k < 144; k++) seq.push({ d: 300, f: walkCell(k) }); }
+pushSet();                               // cycle 0, preset 0
+pushMarkerRefs(); pushWalk(); pushSet(); // cycle 1, preset 1
+pushMarkerRefs(); pushWalk();            // cycle 2, preset 2
+pushMarkerRefs(); pushWalk();            // cycle 3, preset 3
+seq.push({ d: 60000, f: solid(0, 0, 0) });
+
+var t0 = performance.now(), cur = -1;
+function frame() {
+  var t = performance.now() - t0, acc = 0, idx = seq.length - 1;
+  for (var i = 0; i < seq.length; i++) { acc += seq[i].d; if (t < acc) { idx = i; break; } }
+  if (idx !== cur) { cur = idx; seq[idx].f(); }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
