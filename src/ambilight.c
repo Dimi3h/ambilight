@@ -59,6 +59,7 @@ static int g_interval_ms = 50;    // 20 Hz
 static int g_duration_ms = 1000;  // image expiry if the service stops feeding
 static double g_gain = 1.0;       // overall brightness gain before HyperHDR's own adjustment
 static int g_ui_cap_w = 320, g_ui_cap_h = 180;
+static int g_status_ms = 60000;    // status line interval (--status-ms)
 static bool g_ui_blend = true;     // --no-ui-blend: histogram reconstruction only (diagnostics)
 
 // Re-acquire pacing after the histogram is lost (e.g. LG's captureservice grabbing it on
@@ -84,17 +85,31 @@ static uint64_t now_ms(void)
     return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
 }
 
+// Log to stderr, or to a file (--log) that is rotated at LOG_MAX_BYTES (one .1 backup),
+// so a service that runs for months never fills the storage.
+#define LOG_MAX_BYTES (512 * 1024)
+static FILE* g_logf;
+static char g_logpath[256];
+
 static void logmsg(const char* fmt, ...)
 {
+    FILE* out = g_logf ? g_logf : stderr;
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    fprintf(stderr, "[%lld.%03d] ", (long long)ts.tv_sec, (int)(ts.tv_nsec / 1000000));
+    fprintf(out, "[%lld.%03d] ", (long long)ts.tv_sec, (int)(ts.tv_nsec / 1000000));
     va_list ap;
     va_start(ap, fmt);
-    vfprintf(stderr, fmt, ap);
+    vfprintf(out, fmt, ap);
     va_end(ap);
-    fputc('\n', stderr);
-    fflush(stderr);
+    fputc('\n', out);
+    fflush(out);
+    if (g_logf && ftell(g_logf) > LOG_MAX_BYTES) {
+        char old[sizeof(g_logpath) + 2];
+        snprintf(old, sizeof(old), "%s.1", g_logpath);
+        fclose(g_logf);
+        rename(g_logpath, old);
+        g_logf = fopen(g_logpath, "a");
+    }
 }
 
 // libvtcapture calls printLog(ctx, level, id, file, func, line, fmt, ...); interpose a
@@ -753,6 +768,11 @@ int main(int argc, char** argv)
         else if (!strcmp(argv[i], "--gain") && i + 1 < argc) g_gain = atof(argv[++i]);
         else if (!strcmp(argv[i], "--no-ui-blend")) g_ui_blend = false;
         else if (!strcmp(argv[i], "--no-letterbox")) g_lb_enabled = false;
+        else if (!strcmp(argv[i], "--status-ms") && i + 1 < argc) g_status_ms = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--log") && i + 1 < argc) {
+            snprintf(g_logpath, sizeof(g_logpath), "%s", argv[++i]);
+            g_logf = fopen(g_logpath, "a");
+        }
         else if (!strcmp(argv[i], "--calib-presets") && i + 1 < argc) {
             char* s = argv[++i];
             for (char* tok = strtok(s, ","); tok && g_cal_npresets < 8; tok = strtok(NULL, ","))
@@ -850,7 +870,7 @@ int main(int argc, char** argv)
             if (hh_send_image(img, GRID_W, GRID_H)) frames++;
         }
 
-        if (t - t_log >= 5000) {
+        if (t - t_log >= (uint64_t)g_status_ms) {
             logmsg("frames=%u holds=%u reopens=%u hist=%s policy=%d maxgap=%llums totalgap=%llums", frames, holds,
                 reopens, g_hist ? "open" : (down_since && t - down_since < FAST_REACQUIRE_MS ? "lost-fast" : "lost-slow"),
                 g_policy, (unsigned long long)max_gap, (unsigned long long)total_gap);

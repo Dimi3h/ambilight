@@ -26,7 +26,9 @@ mkdir -p "$ST/usr/palm/applications/$APP" \
 
 # --- native service ---
 cp build/ambilight "$ST/usr/palm/services/$SVC/ambilight"
-chmod 755 "$ST/usr/palm/services/$SVC/ambilight"
+cp service/autostart.sh service/supervise.sh service/ambilightctl "$ST/usr/palm/services/$SVC/"
+chmod 755 "$ST/usr/palm/services/$SVC/ambilight" "$ST/usr/palm/services/$SVC/autostart.sh" \
+    "$ST/usr/palm/services/$SVC/supervise.sh" "$ST/usr/palm/services/$SVC/ambilightctl"
 cat > "$ST/usr/palm/services/$SVC/services.json" <<JSON
 {"id":"$SVC","description":"Ambilight hybrid capture service","engine":"native",
  "executable":"ambilight","services":[{"name":"$SVC","description":"Ambilight capture"}]}

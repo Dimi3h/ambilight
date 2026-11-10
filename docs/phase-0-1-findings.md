@@ -326,3 +326,30 @@ Recalibrating letterbox handling: show `app/letterbox.html`, run
 Live check: `app/letterbox-validate.html` + `tools/ledrec.py` +
 `tools/validate_live.py <dump> <ledrec> leds.json --stretch` (run the service with
 `--no-ui-blend`, otherwise the opaque test images come from the UI plane).
+
+### Autostart and emergency brakes — done
+
+Homebrew Channel's boot (`/var/lib/webosbrew/startup.sh`, read on the TV): `run-parts`
+runs the init.d hooks one after another, inside a failsafe window (flag set before the
+hooks, cleared ~10 s after); a reboot in that window skips all hooks next boot. This
+busybox `run-parts` also runs names with dots and only reports a dangling symlink.
+
+Design (`service/`): `70-ambilight` → `autostart.sh` returns at once and starts
+`supervise.sh` detached; the supervisor waits 30 s (past the failsafe window), runs the
+service with a rotating log, restarts it with back-off. Brakes: package missing; a
+`disable` file (`ambilightctl stop`); a boot-loop guard (3 boots without a stable 60 s
+run → disable); a crash-loop guard (5 exits within 60 s → disable). PicCap's autostart is
+switched off through PicCap's own `setSettings {"autostart": false}` (which also removes
+its hook); the previous state is recorded and `tools/uninstall.sh` restores it.
+
+Installed with `tools/install.sh` and verified on the TV:
+- PicCap autostart off (config `false`, its hook gone, previous state `true` saved);
+  ambilight is the only active HyperHDR source (priority 150).
+- Installing while protected content was playing: the service waits (probe every 3 s)
+  and opened the histogram as soon as the home screen showed.
+- **Standby** (remote power off, ~40 s, on): the service keeps running (same pid); LEDs
+  fade to 0 within ~1 s and stay off while the TV is off; on wake the histogram gap was
+  45 ms and the LEDs were back within ~1 s of pressing power.
+- **Reboot** (`machineReboot`): SSH back after 37 s, the hook started the service at
+  uptime 85 s (30 s supervisor delay included), histogram open at once, boot-loop counter
+  reset to 0 after 60 s, HyperHDR source active again.
