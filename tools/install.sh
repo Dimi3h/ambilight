@@ -63,7 +63,8 @@ luna_tv "luna-send -n 1 -w 30000 luna://org.webosbrew.hbchannel.service/exec '{\
 
 if [ -n "$HH" ]; then
     host=${HH%%:*}; port=${HH#*:}; [ "$port" = "$HH" ] && port=19444
-    ssh_tv "echo '--host $host --port $port' > $STATE/args"
+    ssh_tv "$SVC_DIR/ambilightctl set host=$host port=$port" | grep -q '"ok":true' \
+        || { echo "invalid --hyperhdr address" >&2; exit 1; }
 fi
 
 if [ $PICCAP_OFF = 1 ]; then
@@ -86,5 +87,4 @@ elif ssh_tv "[ -L /var/lib/webosbrew/init.d/piccapautostart ]"; then
 fi
 
 echo "== boot hook + start"
-ssh_tv "mkdir -p /var/lib/webosbrew/init.d && ln -sfn $SVC_DIR/autostart.sh /var/lib/webosbrew/init.d/70-ambilight"
-ssh_tv "$SVC_DIR/ambilightctl start"
+ssh_tv "$SVC_DIR/ambilightctl setup"

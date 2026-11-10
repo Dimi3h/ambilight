@@ -10,7 +10,8 @@
 //
 // No LG headers or libraries are needed at build time: the TV's libraries are loaded
 // at runtime with dlopen(). Build with:
-//   zig cc -target arm-linux-gnueabi.2.35 -mcpu=cortex_a9 -O2 -rdynamic -o ambilight ambilight.c -ldl
+//   zig cc -target arm-linux-gnueabi.2.35 -mcpu=cortex_a9 -mfloat-abi=softfp -O2 -rdynamic \
+//       -o ambilight ambilight.c -ldl -lm      (or simply: sh build.sh)
 //
 // API facts (histogram record layout, halgal surface, vt_devmode gate) were measured
 // on the TV and cross-checked against the public-domain webosbrew/tv-native-apis
@@ -21,6 +22,14 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#if defined(__linux__)
+#include <linux/input.h>
+#else // native unit tests on a non-Linux host: just enough to compile
+#include <sys/time.h>
+struct input_event { struct timeval time; unsigned short type, code; int value; };
+#define EV_KEY 1
+#define EVIOCGNAME(len) 0
+#endif
 #include <math.h>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -33,6 +42,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -88,6 +98,20 @@ static uint64_t now_ms(void)
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
 }
+
+// --profile: CPU time of this thread per loop stage, logged every 10 s (developer tool).
+enum { PF_HIST_GET, PF_HIST_PROC, PF_UI_CAPTURE, PF_UI_SCAN, PF_COMPOSE, PF_SEND, PF_LOOP, PF_N };
+static const char* const PF_NAME[PF_N] = { "hist_get", "hist_proc", "ui_capture", "ui_scan", "compose", "send", "loop" };
+static bool g_profile;
+static uint64_t g_pf[PF_N];
+static uint64_t cpu_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+#define PF_BEGIN() uint64_t pf_t0 = g_profile ? cpu_ns() : 0
+#define PF_MARK(i) do { if (g_profile) { uint64_t pf_t1 = cpu_ns(); g_pf[i] += pf_t1 - pf_t0; pf_t0 = pf_t1; } } while (0)
 
 // Log to stderr, or to a file (--log) that is rotated at LOG_MAX_BYTES (one .1 backup),
 // so a service that runs for months never fills the storage.
@@ -427,7 +451,9 @@ static double mean_bin_f(const uint16_t* bins)
 static bool hist_read(uint8_t zrgb[16][3])
 {
     hist_rec_t buf[16];
+    PF_BEGIN();
     if (!g_hist || h_get(g_hist, buf) != 0) return false;
+    PF_MARK(PF_HIST_GET);
     for (int i = 0; i < 16; i++)
         for (int c = 0; c < 3; c++) {
             g_zf[i][c] = mean_bin_f(buf[i].bins[c]);
@@ -440,6 +466,7 @@ static bool hist_read(uint8_t zrgb[16][3])
                 while (t < NLOW && b == LOW_T[t]) g_zlow[i][c][t++] = total ? (double)cum / total : 0;
             }
         }
+    PF_MARK(PF_HIST_PROC);
     return true; // all-black is still a valid reading
 }
 
@@ -457,9 +484,28 @@ static int (*g_galinit)(void);
 static int (*g_create)(uint32_t, uint32_t, uint32_t, gal_surface_t*);
 static int (*g_capture)(gal_surface_t*);
 static gal_surface_t g_surf;
-static uint8_t* g_uimem;
+static uint8_t* g_uimem;   // the capture surface, mapped from /dev/gfx (uncached)
 static size_t g_uilen;
+static uint32_t* g_uicopy; // cached copy of the captured pixels, width*height words
 static bool g_ui_ok;
+
+// Copy n bytes (a multiple of 4) out of the device mapping into cached memory. The mapping
+// is uncached: reading it byte by byte cost ~150 CPU cycles per pixel (18% of a core at
+// 320x180, 20 Hz, measured with --profile), so every byte is fetched once, in 32-byte
+// groups of 64-bit loads. (NEON intrinsics would be wider but crash zig's backend for
+// the soft-float target.)
+static void copy_from_device(void* dst, const void* src, size_t n)
+{
+    const volatile uint64_t* s = src;
+    uint64_t* d = dst;
+    size_t i = 0, words = n / 8;
+    for (; i + 4 <= words; i += 4) {
+        uint64_t a = s[i], b = s[i + 1], c = s[i + 2], e = s[i + 3];
+        d[i] = a; d[i + 1] = b; d[i + 2] = c; d[i + 3] = e;
+    }
+    for (; i < words; i++) d[i] = s[i];
+    if (n & 4) ((uint32_t*)dst)[n / 4 - 1] = ((const volatile uint32_t*)src)[n / 4 - 1];
+}
 
 static bool ui_open(void)
 {
@@ -477,6 +523,11 @@ static bool ui_open(void)
     g_uimem = mmap(NULL, g_uilen, PROT_READ | PROT_WRITE, MAP_SHARED, fd, g_surf.offset);
     close(fd);
     if (g_uimem == MAP_FAILED) { g_uimem = NULL; logmsg("mmap /dev/gfx failed"); return false; }
+    if ((size_t)g_surf.pitch * g_surf.height > g_uilen || g_surf.pitch < g_surf.width * 4u) {
+        logmsg("unexpected surface layout"); return false;
+    }
+    g_uicopy = malloc((size_t)g_surf.width * g_surf.height * 4);
+    if (!g_uicopy) return false;
     g_ui_ok = true;
     logmsg("UI plane ready %ux%u pitch %u", g_surf.width, g_surf.height, g_surf.pitch);
     return true;
@@ -486,27 +537,40 @@ static bool ui_open(void)
 // alpha (0..255). Bytes in memory are B,G,R,A. Returns false if capture failed.
 static bool ui_read(uint8_t urgb[GRID_H][GRID_W][3], uint8_t ualpha[GRID_H][GRID_W])
 {
+    PF_BEGIN();
     if (!g_ui_ok || g_capture(&g_surf) != 0) return false;
+    PF_MARK(PF_UI_CAPTURE);
     int W = g_surf.width, H = g_surf.height, pitch = g_surf.pitch;
+    if (pitch == W * 4)
+        copy_from_device(g_uicopy, g_uimem, (size_t)W * H * 4);
+    else
+        for (int y = 0; y < H; y++) copy_from_device(g_uicopy + (size_t)y * W, g_uimem + (size_t)y * pitch, (size_t)W * 4);
+    int x0[GRID_W + 1], y0[GRID_H + 1];
+    for (int i = 0; i <= GRID_W; i++) x0[i] = i * W / GRID_W;
+    for (int i = 0; i <= GRID_H; i++) y0[i] = i * H / GRID_H;
     for (int gy = 0; gy < GRID_H; gy++)
         for (int gx = 0; gx < GRID_W; gx++) {
-            uint64_t sr = 0, sg = 0, sb = 0, sa = 0;
+            // little-endian word = A<<24 | R<<16 | G<<8 | B (bytes B,G,R,A); 32-bit sums
+            // hold cells of up to 66,000 pixels (a 320x180 capture has 100 per cell)
+            uint32_t sr = 0, sg = 0, sb = 0, sa = 0;
             uint32_t n = 0;
-            for (int y = gy * H / GRID_H; y < (gy + 1) * H / GRID_H; y++)
-                for (int x = gx * W / GRID_W; x < (gx + 1) * W / GRID_W; x++) {
-                    const uint8_t* p = g_uimem + (size_t)y * pitch + (size_t)x * 4;
-                    uint8_t a = p[3];
-                    sr += (uint64_t)p[2] * a;
-                    sg += (uint64_t)p[1] * a;
-                    sb += (uint64_t)p[0] * a;
+            for (int y = y0[gy]; y < y0[gy + 1]; y++) {
+                const uint32_t* row = g_uicopy + (size_t)y * W;
+                for (int x = x0[gx]; x < x0[gx + 1]; x++) {
+                    uint32_t v = row[x], a = v >> 24;
+                    sr += ((v >> 16) & 255) * a;
+                    sg += ((v >> 8) & 255) * a;
+                    sb += (v & 255) * a;
                     sa += a;
-                    n++;
                 }
+                n += (uint32_t)(x0[gx + 1] - x0[gx]);
+            }
             urgb[gy][gx][0] = sa ? (uint8_t)(sr / sa) : 0;
             urgb[gy][gx][1] = sa ? (uint8_t)(sg / sa) : 0;
             urgb[gy][gx][2] = sa ? (uint8_t)(sb / sa) : 0;
             ualpha[gy][gx] = n ? (uint8_t)(sa / n) : 0;
         }
+    PF_MARK(PF_UI_SCAN);
     return true;
 }
 
@@ -558,20 +622,21 @@ static void calib_preset_step(uint64_t t, uint8_t urgb[GRID_H][GRID_W][3], uint8
     was_white = white;
 }
 
-// Uses the surface captured by the preceding ui_read(); no extra capture.
+// Uses the pixels copied by the preceding ui_read(); no extra capture.
 static void calib_dump_ui(uint64_t t)
 {
     static uint8_t prev[CAL_H][CAL_W][4];
     static bool have_prev;
     uint8_t cur[CAL_H][CAL_W][4];
-    int W = g_surf.width, H = g_surf.height, pitch = g_surf.pitch;
+    int W = g_surf.width, H = g_surf.height, pitch = W * 4;
+    const uint8_t* base = (const uint8_t*)g_uicopy;
     bool changed = !have_prev;
     for (int gy = 0; gy < CAL_H; gy++)
         for (int gx = 0; gx < CAL_W; gx++) {
             uint32_t s[4] = { 0 }, n = 0;
             for (int y = gy * H / CAL_H; y < (gy + 1) * H / CAL_H; y++)
                 for (int x = gx * W / CAL_W; x < (gx + 1) * W / CAL_W; x++) {
-                    const uint8_t* p = g_uimem + (size_t)y * pitch + (size_t)x * 4;
+                    const uint8_t* p = base + (size_t)y * pitch + (size_t)x * 4;
                     s[0] += p[2]; s[1] += p[1]; s[2] += p[0]; s[3] += p[3]; // B,G,R,A in memory
                     n++;
                 }
@@ -771,6 +836,12 @@ static char g_args_path[256];
 static char g_status_path[256];
 static const char* DEFAULT_HOST = "192.168.129.249";
 
+#define APP_ID "io.github.dimi3h.ambilight"
+static char g_pause_path[256]; // --pause-file: exists = paused (persists across restarts)
+static bool g_paused;
+static int g_toggle_key;       // --toggle-key <evdev code>: a remote key toggles pause (0 = off)
+static bool g_maintain;        // --maintain: run "ambilightctl maintain" now and then (supervised runs)
+
 static void reset_user_settings(void)
 {
     snprintf(g_host, sizeof(g_host), "%s", DEFAULT_HOST);
@@ -779,6 +850,7 @@ static void reset_user_settings(void)
     g_gain = 1.0;
     g_ui_blend = true;
     g_lb_enabled = true;
+    g_toggle_key = 0;
 }
 
 static void apply_args(int argc, char** argv)
@@ -791,6 +863,10 @@ static void apply_args(int argc, char** argv)
         else if (!strcmp(argv[i], "--gain") && i + 1 < argc) g_gain = atof(argv[++i]);
         else if (!strcmp(argv[i], "--no-ui-blend")) g_ui_blend = false;
         else if (!strcmp(argv[i], "--no-letterbox")) g_lb_enabled = false;
+        else if (!strcmp(argv[i], "--profile")) g_profile = true;
+        else if (!strcmp(argv[i], "--toggle-key") && i + 1 < argc) g_toggle_key = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--pause-file") && i + 1 < argc) snprintf(g_pause_path, sizeof(g_pause_path), "%s", argv[++i]);
+        else if (!strcmp(argv[i], "--maintain")) g_maintain = true;
         else if (!strcmp(argv[i], "--status-ms") && i + 1 < argc) g_status_ms = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--args-file") && i + 1 < argc) i++; // handled in main
         else if (!strcmp(argv[i], "--status-file") && i + 1 < argc) snprintf(g_status_path, sizeof(g_status_path), "%s", argv[++i]);
@@ -839,13 +915,174 @@ static void write_status(const char* hist, double fps, unsigned reopens, uint64_
     if (!f) return;
     fprintf(f, "{\"t\":%lld,\"version\":\"%s\",\"hist\":\"%s\",\"fps\":%.1f,\"reopens\":%u,\"maxgap_ms\":%llu,"
                "\"letterbox\":%d,\"hyperhdr\":%s,\"host\":\"%s\",\"port\":%d,\"priority\":%d,\"gain\":%.2f,"
-               "\"letterbox_detect\":%s,\"ui_blend\":%s,\"ui_cover\":%.2f}\n",
+               "\"letterbox_detect\":%s,\"ui_blend\":%s,\"ui_cover\":%.2f,\"paused\":%s,\"toggle_key\":%d}\n",
         (long long)time(NULL), AMBI_VERSION, hist, fps, reopens, (unsigned long long)max_gap, g_lb_level,
         hh_ok ? "true" : "false", g_host, g_port, g_priority, g_gain, g_lb_enabled ? "true" : "false",
-        g_ui_blend ? "true" : "false", g_ui_cover);
+        g_ui_blend ? "true" : "false", g_ui_cover, g_paused ? "true" : "false", g_toggle_key);
     fclose(f);
     rename(tmp, g_status_path);
 }
+
+// ---------------------------------------------------------------- control: pause, remote key, upkeep
+
+// Run argv[0] detached (double fork, stdio on /dev/null, no inherited descriptors), so the
+// loop never waits for it and no zombie is left behind.
+static void spawn_detached(char* const argv[])
+{
+    pid_t c = fork();
+    if (c == 0) {
+        if (fork() == 0) {
+            setsid();
+            int fd = open("/dev/null", O_RDWR);
+            if (fd >= 0) { dup2(fd, 0); dup2(fd, 1); dup2(fd, 2); }
+            for (int i = 3; i < 1024; i++) close(i);
+            execv(argv[0], argv);
+            _exit(127);
+        }
+        _exit(0);
+    }
+    if (c > 0) waitpid(c, NULL, 0);
+}
+
+// A short on-screen notification (the TV's own toast).
+static void toast(const char* msg)
+{
+    char json[256];
+    snprintf(json, sizeof(json), "{\"sourceId\":\"%s\",\"message\":\"%s\"}", APP_ID, msg);
+    char* argv[] = { "/usr/bin/luna-send", "-n", "1", "-a", APP_ID, "luna://com.webos.notification/createToast", json, NULL };
+    spawn_detached(argv);
+}
+
+static bool pause_file_exists(void) { return g_pause_path[0] && access(g_pause_path, F_OK) == 0; }
+
+// Paused: nothing is sent and our HyperHDR priority is released, but the histogram stays
+// open (read slowly) so protected content keeps its colours when ambilight is resumed.
+static void set_paused(bool p, bool persist, bool announce)
+{
+    if (p == g_paused) return;
+    g_paused = p;
+    if (persist && g_pause_path[0]) {
+        if (p) {
+            FILE* f = fopen(g_pause_path, "w");
+            if (f) { fputs("paused by the remote\n", f); fclose(f); }
+        } else {
+            unlink(g_pause_path);
+        }
+    }
+    if (p) hh_clear();
+    g_ui_cover = 0;
+    logmsg("%s%s", p ? "paused" : "resumed", announce ? " (remote key)" : "");
+    if (announce) toast(p ? "Ambilight uit" : "Ambilight aan");
+}
+
+// Remote key: the LG input devices are read passively (never grabbed), so the TV keeps
+// receiving every key; use a key the TV itself ignores (the blue key, ambilightctl set
+// bluekey=on). LG's driver advertises every key code on every device, so devices are
+// chosen by name. The Magic Remote also reports pointer motion here, which is read and
+// dropped.
+#define MAX_INPUT 12
+static struct pollfd g_in[MAX_INPUT];
+static int g_nin;
+static bool g_in_rescan = true;
+static uint64_t g_in_scan_t;
+
+static void input_close_all(void)
+{
+    for (int i = 0; i < g_nin; i++) close(g_in[i].fd);
+    g_nin = 0;
+}
+
+static void input_scan(void)
+{
+    input_close_all();
+    if (!g_toggle_key) return;
+    char names[256] = "";
+    for (int i = 0; i < 32 && g_nin < MAX_INPUT; i++) {
+        char path[32], name[64] = "";
+        snprintf(path, sizeof(path), "/dev/input/event%d", i);
+        int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+        if (fd < 0) continue;
+        if (ioctl(fd, EVIOCGNAME(sizeof(name) - 1), name) < 0 || strncmp(name, "LGE ", 4) != 0) {
+            close(fd);
+            continue;
+        }
+        g_in[g_nin].fd = fd;
+        g_in[g_nin].events = POLLIN;
+        g_nin++;
+        size_t l = strlen(names);
+        snprintf(names + l, sizeof(names) - l, "%s%s", l ? ", " : "", name);
+    }
+    logmsg("toggle key %d: %d input device(s): %s", g_toggle_key, g_nin, names);
+}
+
+// Drain pending input; true if the toggle key went down (debounced).
+static bool input_read(uint64_t t)
+{
+    static uint64_t last;
+    bool hit = false, lost = false;
+    for (int i = 0; i < g_nin; i++) {
+        if (!g_in[i].revents) continue;
+        struct input_event ev[32];
+        ssize_t r;
+        while ((r = read(g_in[i].fd, ev, sizeof(ev))) > 0)
+            for (size_t k = 0; k < (size_t)r / sizeof(ev[0]); k++)
+                if (ev[k].type == EV_KEY && ev[k].code == g_toggle_key && ev[k].value == 1 && t - last > 400) {
+                    last = t;
+                    hit = true;
+                }
+        if (r == 0 || (r < 0 && errno != EAGAIN && errno != EINTR)) lost = true; // device went away
+        g_in[i].revents = 0;
+    }
+    if (lost) g_in_rescan = true;
+    return hit;
+}
+
+// Sleep until `deadline`, handling remote input meanwhile. Returns early (true) when the
+// toggle key was pressed, so the response is immediate.
+static bool wait_until(uint64_t deadline)
+{
+    for (;;) {
+        uint64_t t = now_ms();
+        if (t >= deadline || g_stop || g_reload) return false;
+        int ms = (int)(deadline - t);
+        if (!g_nin) { usleep((useconds_t)ms * 1000); return false; }
+        if (poll(g_in, (nfds_t)g_nin, ms) > 0 && input_read(now_ms())) return true;
+    }
+}
+
+// The installed executable, to notice when a package update or removal replaces it.
+static char g_self[256];
+static struct stat g_self_st;
+
+static void self_init(void)
+{
+    ssize_t n = readlink("/proc/self/exe", g_self, sizeof(g_self) - 1);
+    g_self[n > 0 ? n : 0] = 0;
+    if (!g_self[0] || stat(g_self, &g_self_st) != 0) g_self[0] = 0;
+}
+
+static bool self_replaced(void)
+{
+    if (!g_self[0]) return false;
+    struct stat st;
+    if (stat(g_self, &st) != 0) return true; // package removed
+    return st.st_ino != g_self_st.st_ino || st.st_dev != g_self_st.st_dev || st.st_size != g_self_st.st_size;
+}
+
+// Periodic upkeep in a separate process (ambilightctl maintain): the daily update check.
+static void run_maintain(void)
+{
+    if (!g_self[0]) return;
+    char ctl[sizeof(g_self) + 16];
+    snprintf(ctl, sizeof(ctl), "%s", g_self);
+    char* slash = strrchr(ctl, '/');
+    if (!slash) return;
+    snprintf(slash + 1, sizeof(ctl) - (size_t)(slash + 1 - ctl), "ambilightctl");
+    char* argv[] = { ctl, "maintain", NULL };
+    spawn_detached(argv);
+}
+
+#define EXIT_REPLACED 75 // the supervisor re-elevates and restarts the new version
 
 #ifndef AMBILIGHT_NO_MAIN
 int main(int argc, char** argv)
@@ -860,6 +1097,8 @@ int main(int argc, char** argv)
     signal(SIGPIPE, SIG_IGN);
     signal(SIGHUP, SIG_IGN); // a background service must survive its launching terminal closing
     signal(SIGUSR1, on_reload);
+    self_init();
+    g_paused = pause_file_exists();
 
     if (!hist_load()) { logmsg("histogram API unavailable"); return 2; }
     if (!ui_open()) logmsg("UI plane unavailable; continuing with histogram only");
@@ -876,17 +1115,41 @@ int main(int argc, char** argv)
     uint64_t t_status = 0;
     unsigned frames_at_status = 0;
     bool hh_ok = false;
+    int rc = 0;
+    uint64_t t_self = now_ms();
+    uint64_t t_maintain = now_ms() + 3 * 60 * 1000; // first upkeep 3 min after start, then every 6 h
 
-    logmsg("ambilight starting: host %s:%d priority %d interval %dms", g_host, g_port, g_priority, g_interval_ms);
+    logmsg("ambilight %s starting: host %s:%d priority %d interval %dms%s", AMBI_VERSION, g_host, g_port, g_priority,
+        g_interval_ms, g_paused ? " (paused)" : "");
 
     while (!g_stop) {
         uint64_t t = now_ms();
+
+        if (t - t_self >= 5000) {
+            t_self = t;
+            if (self_replaced()) {
+                logmsg("executable replaced on disk (package updated or removed): exiting for a restart");
+                rc = EXIT_REPLACED;
+                break;
+            }
+        }
+        if (g_maintain && t >= t_maintain) {
+            t_maintain = t + 6ull * 3600 * 1000;
+            run_maintain();
+        }
+        if (g_toggle_key && (g_in_rescan || (g_nin == 0 && t - g_in_scan_t > 30000) || t - g_in_scan_t > 600000)) {
+            g_in_rescan = false;
+            g_in_scan_t = t;
+            input_scan(); // also picks up a remote that was re-paired or reconnected
+        }
 
         if (g_reload) {
             g_reload = 0;
             char old_host[sizeof(g_host)];
             snprintf(old_host, sizeof(old_host), "%s", g_host);
-            int old_port = g_port, old_prio = g_priority;
+            int old_port = g_port, old_prio = g_priority, old_key = g_toggle_key;
+            bool p = pause_file_exists();
+            if (p != g_paused) set_paused(p, false, false);
             reset_user_settings();
             if (!load_args_file()) logmsg("reload: cannot read %s, using defaults", g_args_path);
             if (old_prio != g_priority) { // release the old priority on HyperHDR first
@@ -897,8 +1160,13 @@ int main(int argc, char** argv)
             }
             if (strcmp(old_host, g_host) || old_port != g_port) hh_close();
             if (!g_lb_enabled) g_lb_level = 0;
-            logmsg("settings reloaded: host %s:%d priority %d gain %.2f letterbox %s ui-blend %s", g_host, g_port,
-                g_priority, g_gain, g_lb_enabled ? "on" : "off", g_ui_blend ? "on" : "off");
+            if (old_key != g_toggle_key) {
+                g_in_rescan = true;
+                if (!g_toggle_key) input_close_all();
+            }
+            logmsg("settings reloaded: host %s:%d priority %d gain %.2f letterbox %s ui-blend %s toggle-key %d%s", g_host,
+                g_port, g_priority, g_gain, g_lb_enabled ? "on" : "off", g_ui_blend ? "on" : "off", g_toggle_key,
+                g_paused ? " (paused)" : "");
         }
 
         if (!g_hist && t >= next_open_try) {
@@ -943,7 +1211,7 @@ int main(int argc, char** argv)
             prev_ok = false; // never average across a gap
         }
 
-        if (have_colour) {
+        if (have_colour && !g_paused) {
             static uint8_t urgb[GRID_H][GRID_W][3];
             static uint8_t ua[GRID_H][GRID_W];
             bool have_ui = g_ui_ok && ui_read(urgb, ua);
@@ -960,9 +1228,29 @@ int main(int argc, char** argv)
                 if (g_cal_npresets > 1) calib_preset_step(t, urgb, ua);
             }
             static uint8_t img[GRID_H * GRID_W * 3];
+            PF_BEGIN();
             compose(zhold, urgb, ua, have_ui && g_ui_blend, img);
+            PF_MARK(PF_COMPOSE);
             hh_ok = hh_send_image(img, GRID_W, GRID_H);
+            PF_MARK(PF_SEND);
             if (hh_ok) frames++;
+        }
+        if (g_profile) {
+            static uint64_t pf_loop_t0, pf_log_t;
+            uint64_t c = cpu_ns();
+            if (pf_loop_t0) g_pf[PF_LOOP] += c - pf_loop_t0; // whole loop incl. everything above
+            pf_loop_t0 = c;
+            if (!pf_log_t) pf_log_t = t;
+            if (t - pf_log_t >= 10000) {
+                char line[256];
+                int n = snprintf(line, sizeof(line), "profile %.0fs cpu%%:", (t - pf_log_t) / 1000.0);
+                for (int i = 0; i < PF_N; i++)
+                    n += snprintf(line + n, sizeof(line) - n, " %s=%.2f", PF_NAME[i],
+                        g_pf[i] / 1e4 / (double)(t - pf_log_t)); // ns / (ms * 1e4) = percent of one core
+                logmsg("%s", line);
+                memset(g_pf, 0, sizeof(g_pf));
+                pf_log_t = t;
+            }
         }
 
         if (t - t_status >= 2000) {
@@ -972,27 +1260,29 @@ int main(int argc, char** argv)
             frames_at_status = frames;
         }
         if (t - t_log >= (uint64_t)g_status_ms) {
-            logmsg("frames=%u holds=%u reopens=%u hist=%s policy=%d maxgap=%llums totalgap=%llums", frames, holds,
+            logmsg("frames=%u holds=%u reopens=%u hist=%s policy=%d maxgap=%llums totalgap=%llums%s", frames, holds,
                 reopens, g_hist ? "open" : (down_since && t - down_since < FAST_REACQUIRE_MS ? "lost-fast" : "lost-slow"),
-                g_policy, (unsigned long long)max_gap, (unsigned long long)total_gap);
+                g_policy, (unsigned long long)max_gap, (unsigned long long)total_gap, g_paused ? " paused" : "");
             t_log = t;
         }
 
         // Pace the loop: normal frame rate while capturing; a short 10 ms step during the
         // fast re-acquire window (catch the clear gap early without a 100% spin); a relaxed
         // 50 ms while slow-probing a prolonged block. Held frames keep going out meanwhile.
+        // Paused: the histogram is only kept alive (2 reads/s). The remote key is handled
+        // while waiting, so it takes effect at once.
         bool fast_phase = down_since && (t - down_since) < FAST_REACQUIRE_MS;
-        int budget = g_hist ? g_interval_ms : (fast_phase ? 10 : 50);
-        uint64_t spent = now_ms() - t;
-        if ((int)spent < budget) usleep((budget - (int)spent) * 1000);
+        int budget = g_hist ? (g_paused ? 500 : g_interval_ms) : (fast_phase ? 10 : 50);
+        if (wait_until(t + (uint64_t)budget)) set_paused(!g_paused, true, true);
     }
 
-    logmsg("shutting down");
+    logmsg("shutting down%s", rc == EXIT_REPLACED ? " for a restart of the new version" : "");
     if (g_calib) fclose(g_calib);
     hh_clear();
     hh_close();
     hist_close();
-    return 0;
+    input_close_all();
+    return rc;
 }
 
 #endif

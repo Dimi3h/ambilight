@@ -12,10 +12,14 @@ SVC=$APP.service
 VER=$(cat VERSION 2>/dev/null || echo 0.1.0)
 TARGET="arm-linux-gnueabi.2.35"
 CPU="cortex_a9"
+# webOS userland uses the soft-float calling convention. softfp keeps that convention
+# (doubles passed in core registers, compatible with the TV's libc/libm) but lets the
+# compiler use the VFP/NEON unit; plain gnueabi would emulate every float op in software.
+FLOAT="-mfloat-abi=softfp"
 
 mkdir -p build
 echo "Compiling ambilight $VER for $TARGET..."
-zig cc -target "$TARGET" -mcpu="$CPU" -O2 -Wall -Wextra -rdynamic -DAMBI_VERSION="\"$VER\"" \
+zig cc -target "$TARGET" -mcpu="$CPU" $FLOAT -O2 -Wall -Wextra -rdynamic -DAMBI_VERSION="\"$VER\"" \
     -o build/ambilight src/ambilight.c -ldl -lm
 
 ST=build/stage
@@ -26,9 +30,11 @@ mkdir -p "$ST/usr/palm/applications/$APP" \
 
 # --- native service ---
 cp build/ambilight "$ST/usr/palm/services/$SVC/ambilight"
-cp service/autostart.sh service/supervise.sh service/ambilightctl "$ST/usr/palm/services/$SVC/"
+cp service/autostart.sh service/supervise.sh service/ambilightctl service/helper.js "$ST/usr/palm/services/$SVC/"
+echo "$VER" > "$ST/usr/palm/services/$SVC/VERSION"
 chmod 755 "$ST/usr/palm/services/$SVC/ambilight" "$ST/usr/palm/services/$SVC/autostart.sh" \
     "$ST/usr/palm/services/$SVC/supervise.sh" "$ST/usr/palm/services/$SVC/ambilightctl"
+chmod 644 "$ST/usr/palm/services/$SVC/helper.js" "$ST/usr/palm/services/$SVC/VERSION"
 cat > "$ST/usr/palm/services/$SVC/services.json" <<JSON
 {"id":"$SVC","description":"Ambilight hybrid capture service","engine":"native",
  "executable":"ambilight","services":[{"name":"$SVC","description":"Ambilight capture"}]}
@@ -37,17 +43,14 @@ JSON
 # --- app: the settings screen (ui/) ---
 cat > "$ST/usr/palm/applications/$APP/appinfo.json" <<JSON
 {"id":"$APP","version":"$VER","vendor":"Dimi3h","type":"web","main":"index.html",
- "title":"Ambilight","icon":"icon.png","resolution":"1920x1080","disableBackHistoryAPI":true,
- "appDescription":"Hybrid ambilight capture for HyperHDR"}
+ "title":"Ambilight","icon":"icon.png","largeIcon":"largeIcon.png","resolution":"1920x1080",
+ "disableBackHistoryAPI":true,"appDescription":"Hybrid ambilight capture for HyperHDR"}
 JSON
 cp ui/index.html ui/app.js "$ST/usr/palm/applications/$APP/"
-# small solid icon (80x80 PNG)
-python3 -I - "$ST/usr/palm/applications/$APP/icon.png" <<'PY'
-import struct,zlib,sys
-w=h=80; raw=b''.join(b'\x00'+bytes([40,90,200])*w for _ in range(h))
-def ch(t,d): return struct.pack('>I',len(d))+t+d+struct.pack('>I',zlib.crc32(t+d)&0xffffffff)
-open(sys.argv[1],'wb').write(b'\x89PNG\r\n\x1a\n'+ch(b'IHDR',struct.pack('>IIBBBBB',w,h,8,2,0,0,0))+ch(b'IDAT',zlib.compress(raw))+ch(b'IEND',b''))
-PY
+# icons (a screen with a coloured glow around it), generated: no binary assets in the repo
+python3 -I tools/make_icon.py 80 "$ST/usr/palm/applications/$APP/icon.png"
+python3 -I tools/make_icon.py 130 "$ST/usr/palm/applications/$APP/largeIcon.png"
+python3 -I tools/make_icon.py 256 build/icon-256.png
 
 cat > "$ST/usr/palm/packages/$APP/packageinfo.json" <<JSON
 {"id":"$APP","version":"$VER","app":"$APP","services":["$SVC"]}

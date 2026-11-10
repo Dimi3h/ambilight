@@ -370,3 +370,68 @@ first), and writes `status.json` every 2 s. Tested with the remote on the TV: br
 ▶▶ reloaded twice without a restart, Ambilight off/on stopped and restarted the service
 with the new settings, Back closed the app. The UI (`ui/`) can be previewed on a desktop
 browser with an in-memory stand-in for `ambilightctl`.
+
+## Phase 3 (2026-11-10): CPU, remote key, Homebrew Channel distribution
+
+### CPU: 24% → 5% of one core
+
+Measured with the new `--profile` flag (thread CPU time per loop stage, 20 Hz, UI plane
+opaque) and cross-checked with `/proc/<pid>/stat`:
+
+| stage | before | soft-float → softfp | + copy-then-scan |
+| --- | --- | --- | --- |
+| read the UI plane (320×180) | 18.0% | 19.4% | **2.2%** |
+| reconstruction + compose | 2.4% | **0.19%** | 0.17% |
+| histogram ioctl | 1.4% | 1.4% | 1.4% |
+| UI capture blit, PNG/JSON send, rest | ~1.5% | ~1.3% | ~1.3% |
+| whole loop | 23.3% | 22.4% | **5.1%** |
+
+- The UI surface is mapped from `/dev/gfx` uncached: reading it byte by byte cost ~150
+  cycles per pixel. Copying it out once with 64-bit loads (4× `ldrd` per 32 bytes) and
+  scanning the copy gives bit-identical results (native unit test `tests/test_ui_read.c`).
+- zig's `arm-linux-gnueabi` target emulated every floating-point operation in software
+  (`__aeabi_dmul` etc., no VFP instruction in the binary). `-mfloat-abi=softfp` keeps the
+  soft-float calling convention of the TV's libc/libm (ELF flags and loader unchanged,
+  doubles to `pow` still in r0–r3) but uses the FPU. NEON intrinsics crash zig 0.17's
+  backend for this target ("Do not know how to split this operator's operand"), so the copy
+  uses scalar 64-bit loads.
+- Paused (LEDs off, histogram kept open, 2 reads/s): 0.2%.
+
+### Remote key
+
+- Key codes (passive evdev reader `probe/keywatch.c` + `lginput2` log lines): `⋯` = 994
+  (`KEY_SCREEN_REMOTE`; short press opens "more actions", long press toggles audio
+  description through `KEY_AUDIO_DESCRIPTION` → `com.webos.app.tvhotkey`), LG Channels =
+  1043 (`KEY_LGCHANNELS`), blue = 401 (`KEY_BLUE`). LG's driver advertises every key code
+  on every input device (`EVIOCGBIT`), so the service selects devices by name (`LGE *`).
+- **LG Channels cannot be taken over cleanly.** surface-manager's key filter
+  (`/usr/lib/qt5/qml/KeyFilters/appLaunch.js`, `handleCPHotkeys`) launches the app from an
+  in-memory table. That table is seeded from the system setting `other/mapping_info`
+  (read once at start-up) and then **overwritten from LG's server** at every boot
+  (`com.webos.service.sdx` `getConfig {"requester":"hot_key"}` → `cb_getHotkeyInfo`, which
+  also writes the setting back). Tested: an entry without `app_id` (which would make the
+  key pass through) was in place at reboot, LG Channels still launched, and the setting
+  read back LG's value afterwards. The original setting was restored and verified identical
+  (backup in `backups/2026-11-10/`, not in git).
+- **Blue key**: the TV logs it and does nothing on the home screen (no key-filter action,
+  no app launch). The service reads it passively and toggles the pause; measured latency
+  from `lginput2` to the service: 5 ms. A toast confirms (`luna-send` without a terminal
+  still performs the call; it only prints nothing).
+
+### Homebrew Channel (0.7.3 on this TV, read in its `index.html` / `service.js`)
+
+- Extra repositories are plain URLs to a feed `{"packages":[{id, title, iconUri,
+  manifest:{version, ipkUrl, ipkHash.sha256, rootRequired, …}}]}` (same format as
+  lg-luma's release asset `repo.json`). `rootRequired` is only displayed.
+- It has **no version comparison and no automatic updates**: an installed app's button just
+  reads "Update". Its `install` method downloads the IPK, checks the SHA-256 and installs
+  with the developer installer; it elevates only itself (self-update), **not** other apps.
+- So after an install from Homebrew Channel nothing of ours runs until the app is opened:
+  the app then runs `ambilightctl setup` (elevate, boot hook, start) through `exec`.
+- Update in place, tested twice on the TV through Homebrew Channel's `install` while the
+  service ran (0.2.0 → 0.2.1 test build → 0.2.0): the installer gives the binary a new
+  inode; the service notices within 5 s and exits 75; the supervisor elevates the new
+  version and `exec`s the new `supervise.sh`; LEDs paused 3.8 s. The package files have a
+  fixed mtime (deterministic IPK), so the inode is what identifies a new version.
+- Not exercised on the TV: removal through Homebrew Channel's Uninstall (the code path
+  removes the boot hook and stops) and the GitHub feed itself (no release published yet).
