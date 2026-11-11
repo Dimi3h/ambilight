@@ -76,7 +76,7 @@
       version: '0.2.0',
       update: { checked: Date.now() / 1000 | 0, current: '0.2.0', latest: '0.2.1', newer: true,
         ipkUrl: RELEASES + 'v0.2.1/io.github.dimi3h.ambilight_0.2.1_arm.ipk', sha256: new Array(65).join('a') },
-      settings: { host: '192.168.129.249', port: 19444, priority: 150, gain: 1.0, letterbox: true, ui_blend: true, bluekey: false } };
+      settings: { host: '192.168.129.249', port: 19444, priority: 150, gain: 1.0, letterbox: true, ui_blend: true, colorkeys: false } };
     return function (args) {
       var a = args.split(' ');
       var ok = function (x) { return Promise.resolve(JSON.stringify(x || { ok: true }) + '\n'); };
@@ -88,7 +88,7 @@
       if (a[0] === 'set') {
         a.slice(1).forEach(function (kv) {
           var k = kv.split('=')[0], v = kv.split('=')[1];
-          if (k === 'letterbox' || k === 'uiblend' || k === 'bluekey') s.settings[k === 'uiblend' ? 'ui_blend' : k] = v === 'on';
+          if (k === 'letterbox' || k === 'uiblend' || k === 'colorkeys') s.settings[k === 'uiblend' ? 'ui_blend' : k] = v === 'on';
           else s.settings[k] = k === 'host' ? v : Number(v);
         });
         return ok();
@@ -178,8 +178,10 @@
     $('log').textContent = (data.log || []).join('\n');
 
     setToggle('vPower', on);
-    $('powerHint').textContent = s.bluekey ? 'Of met de blauwe knop · blijft zo na herstart' : 'Uit blijft uit, ook na herstart';
-    setToggle('vBluekey', s.bluekey);
+    var keys = s.colorkeys === undefined ? !!s.bluekey : s.colorkeys; // bluekey: a service older than 0.2.2
+    $('powerHint').textContent = keys ? 'Of met de blauwe knop · blijft zo na herstart' : 'Uit blijft uit, ook na herstart';
+    $('gainHint').textContent = keys ? '◀ ▶ hier, of groen en geel op de afstandsbediening' : '◀ ▶ om aan te passen';
+    setToggle('vColorkeys', keys);
     setToggle('vLetterbox', s.letterbox);
     setToggle('vUiblend', s.ui_blend);
     renderUpdate();
@@ -240,7 +242,7 @@
       if (!data.running) run('start', 'Ambilight aan');
       else if (data.paused) run('resume', 'Ambilight aan');
       else run('pause', 'Ambilight uit');
-    } else if (key === 'bluekey') setValue('bluekey', s.bluekey ? 'off' : 'on');
+    } else if (key === 'colorkeys') setValue('colorkeys', (s.colorkeys === undefined ? s.bluekey : s.colorkeys) ? 'off' : 'on');
     else if (key === 'letterbox') setValue('letterbox', s.letterbox ? 'off' : 'on');
     else if (key === 'uiblend') setValue('uiblend', s.ui_blend ? 'off' : 'on');
     else if (key === 'update') update();
@@ -322,7 +324,7 @@
     else if (k === KEY.ENTER) activate(key());
     else if (k === KEY.LEFT || k === KEY.RIGHT) {
       if (key() === 'gain') stepGain(k === KEY.LEFT ? -1 : 1);
-      else if (/^(power|bluekey|letterbox|uiblend)$/.test(key())) activate(key());
+      else if (/^(power|colorkeys|letterbox|uiblend)$/.test(key())) activate(key());
     } else if (k === KEY.BACK || k === KEY.ESC) {
       if (window.PalmSystem && window.PalmSystem.platformBack) window.PalmSystem.platformBack();
       else window.close();

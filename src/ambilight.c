@@ -898,6 +898,7 @@ static const char* DEFAULT_HOST = "192.168.129.249";
 static char g_pause_path[256]; // --pause-file: exists = paused (persists across restarts)
 static bool g_paused;
 static int g_toggle_key;       // --toggle-key <evdev code>: a remote key toggles pause (0 = off)
+static int g_dim_key, g_bright_key; // --dim-key / --bright-key: brightness one step down / up
 static bool g_maintain;        // --maintain: run "ambilightctl maintain" now and then (supervised runs)
 
 static void reset_user_settings(void)
@@ -908,7 +909,7 @@ static void reset_user_settings(void)
     g_gain = 1.0;
     g_ui_blend = true;
     g_lb_enabled = true;
-    g_toggle_key = 0;
+    g_toggle_key = g_dim_key = g_bright_key = 0;
 }
 
 static void apply_args(int argc, char** argv)
@@ -923,6 +924,8 @@ static void apply_args(int argc, char** argv)
         else if (!strcmp(argv[i], "--no-letterbox")) g_lb_enabled = false;
         else if (!strcmp(argv[i], "--profile")) g_profile = true;
         else if (!strcmp(argv[i], "--toggle-key") && i + 1 < argc) g_toggle_key = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--dim-key") && i + 1 < argc) g_dim_key = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--bright-key") && i + 1 < argc) g_bright_key = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--pause-file") && i + 1 < argc) snprintf(g_pause_path, sizeof(g_pause_path), "%s", argv[++i]);
         else if (!strcmp(argv[i], "--maintain")) g_maintain = true;
         else if (!strcmp(argv[i], "--status-ms") && i + 1 < argc) g_status_ms = atoi(argv[++i]);
@@ -1046,16 +1049,22 @@ static void set_paused(bool p, bool persist, bool announce)
     if (announce) toast(p ? "Ambilight uit" : "Ambilight aan");
 }
 
-// Remote key: the LG input devices are read passively (never grabbed), so the TV keeps
-// receiving every key; use a key the TV itself ignores (the blue key, ambilightctl set
-// bluekey=on). LG's driver advertises every key code on every device, so devices are
-// chosen by name. The Magic Remote also reports pointer motion here, which is read and
-// dropped.
+// Remote keys: the LG input devices are read passively (never grabbed), so the TV keeps
+// receiving every key; use keys the TV itself ignores in normal use (the colour keys,
+// ambilightctl set colorkeys=on: blue toggles, green dims, yellow brightens). Only short
+// presses are used: LG gives its own meaning to holding yellow for 5 s and to seven quick
+// presses of green on an HDMI input (see the findings). LG's driver advertises every key
+// code on every device, so devices are chosen by name. The Magic Remote also reports
+// pointer motion here, which is read and dropped.
 #define MAX_INPUT 12
 static struct pollfd g_in[MAX_INPUT];
 static int g_nin;
 static bool g_in_rescan = true;
 static uint64_t g_in_scan_t;
+static bool g_key_toggle; // set by input_read(), handled and cleared by the main loop
+static int g_key_steps;   // brightness steps asked for (+ brighter, - dimmer)
+
+static bool keys_wanted(void) { return g_toggle_key || g_dim_key || g_bright_key; }
 
 static void input_close_all(void)
 {
@@ -1066,7 +1075,7 @@ static void input_close_all(void)
 static void input_scan(void)
 {
     input_close_all();
-    if (!g_toggle_key) return;
+    if (!keys_wanted()) return;
     char names[256] = "";
     for (int i = 0; i < 32 && g_nin < MAX_INPUT; i++) {
         char path[32], name[64] = "";
@@ -1083,13 +1092,30 @@ static void input_scan(void)
         size_t l = strlen(names);
         snprintf(names + l, sizeof(names) - l, "%s%s", l ? ", " : "", name);
     }
-    logmsg("toggle key %d: %d input device(s): %s", g_toggle_key, g_nin, names);
+    logmsg("remote keys (toggle %d, dim %d, bright %d): %d input device(s): %s", g_toggle_key, g_dim_key,
+        g_bright_key, g_nin, names);
 }
 
-// Drain pending input; true if the toggle key went down (debounced).
+// One key event. Only a key going down counts (value 1): releases and auto-repeat are
+// ignored, so holding a key does nothing. The toggle is debounced.
+static bool key_event(int code, int value, uint64_t t)
+{
+    static uint64_t last_toggle;
+    if (value != 1 || !code) return false;
+    if (code == g_toggle_key) {
+        if (t - last_toggle <= 400) return false;
+        last_toggle = t;
+        g_key_toggle = !g_key_toggle; // two presses in one read cancel out
+        return true;
+    }
+    if (code == g_dim_key) { g_key_steps--; return true; }
+    if (code == g_bright_key) { g_key_steps++; return true; }
+    return false;
+}
+
+// Drain pending input; true if one of our keys went down.
 static bool input_read(uint64_t t)
 {
-    static uint64_t last;
     bool hit = false, lost = false;
     for (int i = 0; i < g_nin; i++) {
         if (!g_in[i].revents) continue;
@@ -1097,10 +1123,7 @@ static bool input_read(uint64_t t)
         ssize_t r;
         while ((r = read(g_in[i].fd, ev, sizeof(ev))) > 0)
             for (size_t k = 0; k < (size_t)r / sizeof(ev[0]); k++)
-                if (ev[k].type == EV_KEY && ev[k].code == g_toggle_key && ev[k].value == 1 && t - last > 400) {
-                    last = t;
-                    hit = true;
-                }
+                if (ev[k].type == EV_KEY && key_event(ev[k].code, ev[k].value, t)) hit = true;
         if (r == 0 || (r < 0 && errno != EAGAIN && errno != EINTR)) lost = true; // device went away
         g_in[i].revents = 0;
     }
@@ -1108,8 +1131,8 @@ static bool input_read(uint64_t t)
     return hit;
 }
 
-// Sleep until `deadline`, handling remote input meanwhile. Returns early (true) when the
-// toggle key was pressed, so the response is immediate. Input is read at least once even
+// Sleep until `deadline`, handling remote input meanwhile. Returns early (true) when one
+// of our keys was pressed, so the response is immediate. Input is read at least once even
 // when the loop is already past its deadline, so the key keeps working under load.
 static bool wait_until(uint64_t deadline)
 {
@@ -1145,8 +1168,8 @@ static bool self_replaced(void)
     return st.st_ino != g_self_st.st_ino || st.st_dev != g_self_st.st_dev || st.st_size != g_self_st.st_size;
 }
 
-// Periodic upkeep in a separate process (ambilightctl maintain): the daily update check.
-static void run_maintain(void)
+// Run "ambilightctl <a1> [<a2>]" (it sits next to this executable) in a separate process.
+static void run_ctl(const char* a1, const char* a2)
 {
     if (!g_self[0]) return;
     char ctl[sizeof(g_self) + 16];
@@ -1154,8 +1177,46 @@ static void run_maintain(void)
     char* slash = strrchr(ctl, '/');
     if (!slash) return;
     snprintf(slash + 1, sizeof(ctl) - (size_t)(slash + 1 - ctl), "ambilightctl");
-    char* argv[] = { ctl, "maintain", NULL };
+    char* argv[] = { ctl, (char*)a1, (char*)a2, NULL };
     spawn_detached(argv);
+}
+
+// Brightness by remote key: steps of 10 percentage points within the range the settings
+// accept (10-300 %). The new value applies at once; the on-screen message and the write to
+// the settings file follow shortly after the last press, so a burst of presses gives one
+// message and one write.
+#define GAIN_STEP_PCT 10
+#define GAIN_MIN_PCT 10
+#define GAIN_MAX_PCT 300
+static uint64_t g_gain_toast_at, g_gain_save_at;
+
+static int gain_pct(void) { return (int)(g_gain * 100 + 0.5); }
+
+static void gain_step(int steps, uint64_t t)
+{
+    int pct = (gain_pct() + GAIN_STEP_PCT / 2) / GAIN_STEP_PCT * GAIN_STEP_PCT + steps * GAIN_STEP_PCT;
+    if (pct < GAIN_MIN_PCT) pct = GAIN_MIN_PCT;
+    if (pct > GAIN_MAX_PCT) pct = GAIN_MAX_PCT;
+    g_gain = pct / 100.0;
+    g_gain_toast_at = t + 600;
+    g_gain_save_at = t + 1200;
+    logmsg("brightness %d%% (remote key)", pct);
+}
+
+static void gain_followup(uint64_t t)
+{
+    if (g_gain_toast_at && t >= g_gain_toast_at) {
+        g_gain_toast_at = 0;
+        char msg[64];
+        snprintf(msg, sizeof(msg), "Ambilight helderheid %d%%", gain_pct());
+        toast(msg);
+    }
+    if (g_gain_save_at && t >= g_gain_save_at) {
+        g_gain_save_at = 0;
+        char kv[32];
+        snprintf(kv, sizeof(kv), "gain=%.2f", g_gain);
+        run_ctl("set", kv); // validates, rewrites the settings file and signals us to reload it
+    }
 }
 
 #define EXIT_REPLACED 75 // the supervisor re-elevates and restarts the new version
@@ -1212,9 +1273,10 @@ int main(int argc, char** argv)
         }
         if (g_maintain && t >= t_maintain) {
             t_maintain = t + 6ull * 3600 * 1000;
-            run_maintain();
+            run_ctl("maintain", NULL); // periodic upkeep: the daily update check
         }
-        if (g_toggle_key && (g_in_rescan || (g_nin == 0 && t - g_in_scan_t > 30000) || t - g_in_scan_t > 600000)) {
+        gain_followup(t);
+        if (keys_wanted() && (g_in_rescan || (g_nin == 0 && t - g_in_scan_t > 30000) || t - g_in_scan_t > 600000)) {
             g_in_rescan = false;
             g_in_scan_t = t;
             input_scan(); // also picks up a remote that was re-paired or reconnected
@@ -1224,11 +1286,14 @@ int main(int argc, char** argv)
             g_reload = 0;
             char old_host[sizeof(g_host)];
             snprintf(old_host, sizeof(old_host), "%s", g_host);
-            int old_port = g_port, old_prio = g_priority, old_key = g_toggle_key;
+            int old_port = g_port, old_prio = g_priority;
+            int old_keys[3] = { g_toggle_key, g_dim_key, g_bright_key };
+            double key_gain = g_gain; // a brightness key press that is not written to the file yet
             bool p = pause_file_exists();
             if (p != g_paused) set_paused(p, false, false);
             reset_user_settings();
             if (!load_args_file()) logmsg("reload: cannot read %s, using defaults", g_args_path);
+            if (g_gain_save_at) g_gain = key_gain;
             if (old_prio != g_priority) { // release the old priority on HyperHDR first
                 int new_prio = g_priority;
                 g_priority = old_prio;
@@ -1241,13 +1306,13 @@ int main(int argc, char** argv)
                 g_hh_state = HH_NEVER;
             }
             if (!g_lb_enabled) g_lb_level = 0;
-            if (old_key != g_toggle_key) {
+            if (old_keys[0] != g_toggle_key || old_keys[1] != g_dim_key || old_keys[2] != g_bright_key) {
                 g_in_rescan = true;
-                if (!g_toggle_key) input_close_all();
+                if (!keys_wanted()) input_close_all();
             }
-            logmsg("settings reloaded: host %s:%d priority %d gain %.2f letterbox %s ui-blend %s toggle-key %d%s", g_host,
+            logmsg("settings reloaded: host %s:%d priority %d gain %.2f letterbox %s ui-blend %s keys %d/%d/%d%s", g_host,
                 g_port, g_priority, g_gain, g_lb_enabled ? "on" : "off", g_ui_blend ? "on" : "off", g_toggle_key,
-                g_paused ? " (paused)" : "");
+                g_dim_key, g_bright_key, g_paused ? " (paused)" : "");
         }
 
         if (!g_hist && t >= next_open_try) {
@@ -1359,7 +1424,12 @@ int main(int argc, char** argv)
         // while waiting, so it takes effect at once.
         bool fast_phase = down_since && (t - down_since) < FAST_REACQUIRE_MS;
         int budget = g_hist ? (g_paused ? 500 : g_interval_ms) : (fast_phase ? 10 : 50);
-        if (wait_until(t + (uint64_t)budget)) set_paused(!g_paused, true, true);
+        if (wait_until(t + (uint64_t)budget)) {
+            if (g_key_toggle) set_paused(!g_paused, true, true);
+            if (g_key_steps) gain_step(g_key_steps, now_ms());
+            g_key_toggle = false;
+            g_key_steps = 0;
+        }
     }
 
     logmsg("shutting down%s", rc == EXIT_REPLACED ? " for a restart of the new version" : "");

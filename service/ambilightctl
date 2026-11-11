@@ -6,13 +6,14 @@
 #   stop               write the disable flag (persists across reboots), stop the service
 #   restart            stop, then start
 #   pause | resume     LEDs off/on while the service keeps running (persists; the blue
-#   toggle             remote key does the same when bluekey=on)
+#   toggle             remote key does the same when colorkeys=on)
 #   status             human-readable state, disable reason, recent log lines
 #   json-status        the same as one JSON object (for the settings app)
 #   set key=value ...  change settings and apply them without a restart; keys:
 #                      host, port (1-65535), priority (1-253), gain (0.1-3.0),
-#                      letterbox (on|off), uiblend (on|off), bluekey (on|off: the remote's
-#                      blue key toggles ambilight). Prints {"ok":...}.
+#                      letterbox (on|off), uiblend (on|off), colorkeys (on|off: on the
+#                      remote blue toggles ambilight, green dims, yellow brightens; the old
+#                      name bluekey is still accepted). Prints {"ok":...}.
 #   setup              first run after an install from Homebrew Channel: elevate the
 #                      service, add the boot hook, start
 #   elevate            (re)grant the service its permissions through Homebrew Channel
@@ -25,7 +26,11 @@ STATE=/media/developer/ambilight
 HOOK=/var/lib/webosbrew/init.d/70-ambilight
 HB_ELEVATE=/media/developer/apps/usr/palm/services/org.webosbrew.hbchannel.service/elevate-service
 FEED_URL=https://github.com/Dimi3h/ambilight/releases/latest/download/repo.json
-BLUE_KEY=401 # KEY_BLUE on LG's Magic Remote (measured: evdev, lginput2 logs; the TV ignores it)
+# Colour keys of LG's remotes (the TV's own keymap, /etc/webos-profile/common/profile_keymap.json;
+# blue also measured with evdev). The TV ignores short presses of them in normal use.
+BLUE_KEY=401
+GREEN_KEY=399
+YELLOW_KEY=400
 mkdir -p "$STATE"
 
 running() { pidof ambilight > /dev/null 2>&1; }
@@ -98,7 +103,7 @@ status() {
 
 # --- settings: read $STATE/args into variables (defaults first)
 read_settings() {
-    host=192.168.129.249 port=19444 priority=150 gain=1.0 letterbox=on uiblend=on bluekey=off
+    host=192.168.129.249 port=19444 priority=150 gain=1.0 letterbox=on uiblend=on colorkeys=off
     # shellcheck disable=SC2046 # word splitting of the args file is intended
     set -- $(cat "$STATE/args" 2> /dev/null)
     while [ $# -gt 0 ]; do
@@ -109,7 +114,8 @@ read_settings() {
             --gain) gain=$2; shift ;;
             --no-letterbox) letterbox=off ;;
             --no-ui-blend) uiblend=off ;;
-            --toggle-key) bluekey=on; shift ;;
+            --toggle-key) colorkeys=on; shift ;;
+            --dim-key | --bright-key) shift ;;
         esac
         shift
     done
@@ -119,7 +125,7 @@ write_settings() {
     line="--host $host --port $port --priority $priority --gain $gain"
     [ "$letterbox" = off ] && line="$line --no-letterbox"
     [ "$uiblend" = off ] && line="$line --no-ui-blend"
-    [ "$bluekey" = on ] && line="$line --toggle-key $BLUE_KEY"
+    [ "$colorkeys" = on ] && line="$line --toggle-key $BLUE_KEY --dim-key $GREEN_KEY --bright-key $YELLOW_KEY"
     echo "$line" > "$STATE/args.tmp" && mv "$STATE/args.tmp" "$STATE/args"
     sync
 }
@@ -148,9 +154,11 @@ set_settings() {
                 case "$v" in '' | *[!0-9.]* | *.*.*) fail "invalid gain" ;; esac
                 awk -v g="$v" 'BEGIN { exit !(g >= 0.1 && g <= 3.0) }' || fail "invalid gain"
                 gain=$v ;;
-            letterbox | uiblend | bluekey)
+            letterbox | uiblend)
                 case "$v" in on | off) ;; *) fail "invalid $k" ;; esac
                 eval "$k=\$v" ;;
+            colorkeys | bluekey)
+                case "$v" in on | off) colorkeys=$v ;; *) fail "invalid $k" ;; esac ;;
             *) fail "unknown key" ;;
         esac
     done
@@ -179,6 +187,17 @@ check_update() {
             fi ;;
     esac
     echo "$out"
+}
+
+# Settings written by an older version: the colour-key setting used to be the blue key
+# only. Run by the supervisor before it starts the service.
+migrate() {
+    if grep -q -- '--toggle-key' "$STATE/args" 2> /dev/null && ! grep -q -- '--dim-key' "$STATE/args"; then
+        read_settings
+        write_settings
+        log "settings migrated: colour keys now include green (dim) and yellow (brighten)"
+    fi
+    return 0
 }
 
 maintain() {
@@ -224,9 +243,10 @@ json_status() {
     fi
     printf '{"running":%s,"supervisor":%s,"autostart":%s,"paused":%s,"disabled":%s,"boot_count":%s,"version":"%s",' \
         "$r" "$sv" "$hook" "$paused" "$dis" "$bc" "$ver"
-    printf '"settings":{"host":"%s","port":%s,"priority":%s,"gain":%s,"letterbox":%s,"ui_blend":%s,"bluekey":%s},' \
+    printf '"settings":{"host":"%s","port":%s,"priority":%s,"gain":%s,"letterbox":%s,"ui_blend":%s,"colorkeys":%s,"bluekey":%s},' \
         "$host" "$port" "$priority" "$gain" "$([ "$letterbox" = on ] && echo true || echo false)" \
-        "$([ "$uiblend" = on ] && echo true || echo false)" "$([ "$bluekey" = on ] && echo true || echo false)"
+        "$([ "$uiblend" = on ] && echo true || echo false)" "$([ "$colorkeys" = on ] && echo true || echo false)" \
+        "$([ "$colorkeys" = on ] && echo true || echo false)"
     printf '"update":%s,"status":%s,"log":[%s]}\n' "$upd" "$st" "${logl%,}"
 }
 
@@ -244,5 +264,6 @@ case "$1" in
     elevate) elevate && echo elevated ;;
     check-update) check_update ;;
     maintain) maintain ;;
+    migrate) migrate ;;
     *) echo "usage: $0 start|stop|restart|pause|resume|toggle|status|json-status|set key=value...|setup|elevate|check-update|maintain" >&2; exit 2 ;;
 esac

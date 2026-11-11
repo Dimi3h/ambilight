@@ -74,15 +74,15 @@
   <section class="rows" id="rows">
     <div class="row" data-key="power"><div class="label">Ambilight<small id="powerHint">Uit blijft uit, ook na herstart</small></div>
       <div class="toggle" id="vPower">–</div></div>
-    <div class="row" data-key="bluekey"><div class="label">Blauwe knop<small>Zet Ambilight aan en uit met de blauwe knop van de afstandsbediening</small></div>
-      <div class="toggle" id="vBluekey">–</div></div>
+    <div class="row" data-key="colorkeys"><div class="label">Gekleurde knoppen<small>Blauw: aan en uit · groen: minder licht · geel: meer licht</small></div>
+      <div class="toggle" id="vColorkeys">–</div></div>
     <div class="row" data-key="host"><div class="label">HyperHDR-adres<small>IP-adres of naam van de Pi</small></div>
       <input id="vHost" type="text" maxlength="63" spellcheck="false"></div>
     <div class="row" data-key="port"><div class="label">Poort<small>JSON-API van HyperHDR</small></div>
       <input id="vPort" type="number" min="1" max="65535"></div>
     <div class="row" data-key="priority"><div class="label">Prioriteit<small>Lager = belangrijker in HyperHDR</small></div>
       <input id="vPriority" type="number" min="1" max="253"></div>
-    <div class="row" data-key="gain"><div class="label">Helderheid<small>◀ ▶ om aan te passen</small></div>
+    <div class="row" data-key="gain"><div class="label">Helderheid<small id="gainHint">◀ ▶ om aan te passen</small></div>
       <div class="stepper"><b>◀</b><span id="vGain">–</span><b>▶</b></div></div>
     <div class="row" data-key="letterbox"><div class="label">Zwarte balken herkennen<small>Beeld oprekken bij 21:9-films</small></div>
       <div class="toggle" id="vLetterbox">–</div></div>

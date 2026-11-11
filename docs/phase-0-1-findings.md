@@ -553,3 +553,16 @@ luna-send -n 1 luna://com.webos.service.config/setConfigs '{"configs":{"com.webo
 Still to observe in normal use (the service log shows it, also while paused): that the
 value survives a reboot, whether the short losses at app switches are gone, and a long
 protected Disney+ run without a loss (`reopens` not increasing, never `hist=lost-slow`).
+
+### Green and yellow keys for brightness (0.2.2)
+
+- Codes from the TV's own keymap (`/etc/webos-profile/common/profile_keymap.json`): red 398,
+  green 399, yellow 400, blue 401 (blue also measured with evdev).
+- What LG's key filters do with them on this TV (`KeyFilters/appLaunch.js`, both handlers
+  are in the active list): `handleFreeSyncInfo` counts green releases and, at seven within
+  5 s while an HDMI input is in the foreground, launches `com.webos.app.tvhotkey` with
+  `freesync-info`; `handleHotkeys` starts a 5 s long-press timer with a spinner on yellow
+  and then calls `launchAGP` (LG's pattern launcher). Short presses pass through.
+- Hence: only key-down events count, no hold-to-repeat; one press is 10 percentage points
+  (10–300 %). The message and the write to the settings file follow 0.6 s and 1.2 s after
+  the last press, so a burst gives one toast and one write.

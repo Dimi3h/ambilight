@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.2
+
+- Colour keys: next to blue (on/off), green now dims and yellow brightens, 10 % per short
+  press, with one on-screen message after the last press. The setting "Blauwe knop" became
+  "Gekleurde knoppen"; an existing setting is carried over.
+
 ## 0.2.1
 
 Fixes from a full review of the project.
