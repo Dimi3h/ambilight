@@ -86,7 +86,7 @@ Open **Ambilight** from the TV's app list. With the remote (▲▼ choose, OK ch
 - let the remote's **blue key** switch ambilight on and off (a short on-screen message
   confirms it);
 - set the HyperHDR address, port and priority;
-- adjust brightness (10–300 %);
+- adjust brightness (10–300 %; it scales everything sent to the LEDs, picture and menus);
 - switch black-bar detection and UI blending (menus, subtitles) on or off;
 - check for and install updates;
 - see the live state: picture source, HyperHDR connection, detected bars, frames/s,
@@ -122,7 +122,9 @@ $C setup                  # elevate + boot hook + start (the app runs this on fi
 Settings are stored in `/media/developer/ambilight/args` and reloaded by the service on
 `SIGUSR1` (`ambilightctl set` does this); a pause is the file `paused` next to it. Logs:
 `/media/developer/ambilight/` (`ambilight.log`, rotated at 512 KB; `supervise.log`); live
-state: `status.json` (every 2 s); last update check: `update.json`.
+state: `status.json` (written every 2 s, but only while the app or `json-status` asks for
+it, so nothing is written to the TV's flash around the clock); last update check:
+`update.json`.
 
 ## Autostart and emergency brakes
 
@@ -133,7 +135,7 @@ ambilight were not installed:
 
 1. **Package missing** – the hook does nothing (a dangling hook link is skipped).
 2. **`/media/developer/ambilight/disable` exists** – manual off switch (`ambilightctl stop`).
-3. **Boot-loop guard** – three boots in a row without the service running a stable 60 s
+3. **Boot-loop guard** – three boots in a row without the service running a stable 20 s
    writes the disable file with the reason.
 4. **Crash-loop guard** – five service exits within 60 s each writes the disable file.
 5. **Homebrew Channel failsafe** – a reboot during its startup window skips all hooks on
@@ -160,9 +162,11 @@ supervisor removes the boot hook and stops.
 
 ## Rollback (complete)
 
-From Homebrew Channel: **Uninstall** on the Ambilight page removes the package; the running
-supervisor notices, clears its HyperHDR priority, removes the boot hook and stops. Settings
-and logs stay in `/media/developer/ambilight` (delete that folder to remove them too).
+From Homebrew Channel: **Uninstall** on the Ambilight page removes the package. If the
+service is running, its supervisor notices, clears the HyperHDR priority, removes the boot
+hook and stops (this path has not been exercised on the TV yet); otherwise the boot hook is
+left as a dangling link, which is skipped at boot. Settings and logs stay in
+`/media/developer/ambilight` (delete that folder to remove them too).
 
 From a computer:
 
@@ -195,12 +199,22 @@ rm -rf /media/developer/ambilight
   LG's own capture service briefly takes the capture resource on some app switches; if
   that happens right as protected playback starts, the last colours are held until a
   clear moment (menu, pause, next app).
+- **Open question (measured 2026-11-11):** after a third-party streaming app was started,
+  something on the TV took the capture resource every ~122 s for ~1.4 s (the LEDs hold their
+  colours meanwhile), also on the home screen, until the screensaver started. The caller is
+  not identified yet. During protected playback such a loss cannot be repaired, and the
+  longest protected run measured so far was ~100 s: colours during a whole film are
+  unproven. See the findings.
+- The white point in the profile was measured in the picture mode "cinema"; other modes,
+  HDR and Dolby Vision are not calibrated and may tint the LEDs.
 - Calibration (`src/profile_b4.h`, `src/letterbox_b4.h`) is for the B4 on this firmware;
   `tools/calibrate.py` and `tools/letterbox.py` regenerate it (procedure in the findings).
 
 ## Development tools
 
-`sh tests/run.sh` (native unit tests), `tools/calibrate.py`, `tools/letterbox.py` (offline
+`sh tests/run.sh` (native unit tests: UI reader, compose/brightness, PNG encoder, update
+feed), `tools/ledtest.py` (dim test colours and an edge pattern straight to HyperHDR, to
+check a real strip's colour order and layout), `tools/calibrate.py`, `tools/letterbox.py` (offline
 analysis of `--calib-dump` captures), `tools/ledrec.py` + `tools/validate_live.py` (live
 check of HyperHDR's LED output), the service's `--profile` flag (CPU time per loop stage,
 logged every 10 s), `probe/keywatch.c` (prints remote key codes, passively), `probe/`

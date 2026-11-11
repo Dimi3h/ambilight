@@ -9,7 +9,7 @@ cd "$(dirname "$0")"
 
 APP=io.github.dimi3h.ambilight
 SVC=$APP.service
-VER=$(cat VERSION 2>/dev/null || echo 0.1.0)
+VER=$(cat VERSION)
 TARGET="arm-linux-gnueabi.2.35"
 CPU="cortex_a9"
 # webOS userland uses the soft-float calling convention. softfp keeps that convention
@@ -19,7 +19,9 @@ FLOAT="-mfloat-abi=softfp"
 
 mkdir -p build
 echo "Compiling ambilight $VER for $TARGET..."
-zig cc -target "$TARGET" -mcpu="$CPU" $FLOAT -O2 -Wall -Wextra -rdynamic -DAMBI_VERSION="\"$VER\"" \
+# -s: no debug info in the package (951 kB -> 109 kB); -rdynamic keeps printLog exported,
+# which interposes libvtcapture's logging.
+zig cc -target "$TARGET" -mcpu="$CPU" $FLOAT -O2 -s -Wall -Wextra -Wshadow -rdynamic -DAMBI_VERSION="\"$VER\"" \
     -o build/ambilight src/ambilight.c -ldl -lm
 
 ST=build/stage

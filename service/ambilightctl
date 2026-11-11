@@ -2,6 +2,7 @@
 # ambilightctl - control the ambilight service on the TV (also used by the settings app
 # through Homebrew Channel's exec).
 #   start              clear the disable and pause flags and the boot-loop counter, start now
+#                      (setup does the same but keeps a pause)
 #   stop               write the disable flag (persists across reboots), stop the service
 #   restart            stop, then start
 #   pause | resume     LEDs off/on while the service keeps running (persists; the blue
@@ -45,18 +46,25 @@ stop() {
     [ -n "$pid" ] && kill "$pid" 2> /dev/null # SIGTERM: the service clears its HyperHDR priority
     i=0
     while running && [ $i -lt 30 ]; do sleep 0.2; i=$((i + 1)); done
-    running && pkill -9 -f "$SVC_DIR/ambilight"
+    # by pid, not by path pattern: "$SVC_DIR/ambilight" would also match this script
+    if running; then kill -9 $(pidof ambilight) 2> /dev/null; fi
     pkill -f "$SVC_DIR/supervise.sh" 2> /dev/null
     echo "stopped"
 }
 
-start() {
-    rm -f "$STATE/disable" "$STATE/paused"
+# Clear the guards and make sure the supervisor runs. A pause is kept.
+launch() {
+    rm -f "$STATE/disable"
     echo 0 > "$STATE/boot-attempts"
     sync
-    signal_service # a running (paused) service resumes
+    signal_service # a running service re-reads its settings and pause state
     setsid "$SVC_DIR/supervise.sh" now < /dev/null > /dev/null 2>&1 & # exits at once if one runs
     sleep 1
+}
+
+start() {
+    rm -f "$STATE/paused"
+    launch
 }
 
 pause() { echo "$(date '+%F %T') paused by ambilightctl" > "$STATE/paused"; sync; signal_service; echo paused; }
@@ -71,7 +79,7 @@ setup() {
     elevate || echo "warning: elevation failed (see $STATE/supervise.log)"
     mkdir -p /var/lib/webosbrew/init.d && ln -sfn "$SVC_DIR/autostart.sh" "$HOOK"
     log "setup: boot hook added"
-    start
+    launch # an upgrade keeps a pause; a first install has none
 }
 
 status() {
@@ -194,11 +202,19 @@ json_status() {
     case "$bc" in '' | *[!0-9]*) bc=0 ;; esac
     ver=$(cat "$SVC_DIR/VERSION" 2> /dev/null | tr -cd '0-9.')
     st=null
-    if [ "$r" = true ] && [ -f "$STATE/status.json" ]; then
-        st=$(cat "$STATE/status.json")
-        # stale status (service hung) after 10 s
-        t=$(echo "$st" | sed -n 's/.*"t":\([0-9]*\).*/\1/p')
-        [ -n "$t" ] && [ $(($(date +%s) - t)) -gt 10 ] && st=null
+    if [ "$r" = true ]; then
+        # the service writes status.json only while someone asks: say so, then give it a
+        # moment (one loop: 50 ms, 500 ms while paused) to write a fresh one
+        : > "$STATE/status.json.want"
+        i=0
+        while [ $i -lt 10 ]; do
+            t=$(sed -n 's/.*"t":\([0-9]*\).*/\1/p' "$STATE/status.json" 2> /dev/null)
+            [ -n "$t" ] && [ $(($(date +%s) - t)) -le 3 ] && break
+            sleep 0.1
+            i=$((i + 1))
+        done
+        # no fresh status after a second: the service hangs or is still starting
+        [ $i -lt 10 ] && st=$(cat "$STATE/status.json")
     fi
     upd=null
     [ -f "$STATE/update.json" ] && upd=$(cat "$STATE/update.json")

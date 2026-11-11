@@ -1,12 +1,11 @@
 // ambilight: hybrid capture service for rooted LG webOS TVs.
 //
-// MVP (phase-2 step 1): keeps the LG histogram open continuously (16 colour zones,
-// works for every source including DRM/SVP), captures the graphics/UI plane at the
-// same time, blends them, and sends the result to HyperHDR as a small PNG over the
-// JSON API (one origin, one priority). The histogram handle is never closed, so DRM
-// colours keep flowing; a lost handle (e.g. LG's captureservice grabbing it on an app
-// switch, or protected playback) is tolerated by holding the last colours and retrying
-// the open while it is allowed again.
+// Keeps the LG histogram open continuously (16 colour zones, also delivered during
+// DRM/SVP playback as long as the handle was open before it started), captures the
+// graphics/UI plane at the same time, blends them, and sends the result to HyperHDR as a
+// small PNG over the JSON API (one origin, one priority). A lost handle (LG's
+// captureservice taking the capture resource) is tolerated by holding the last colours
+// and retrying the open; during protected playback that retry cannot succeed.
 //
 // No LG headers or libraries are needed at build time: the TV's libraries are loaded
 // at runtime with dlopen(). Build with:
@@ -258,49 +257,98 @@ static size_t base64_encode(const uint8_t* in, size_t n, char* out)
 
 // ---------------------------------------------------------------- HyperHDR JSON client
 
+// The loop must stay responsive (remote key, histogram re-acquire) while HyperHDR is away,
+// e.g. the Pi is off: a connect attempt waits at most HH_CONNECT_MS and is repeated only
+// every HH_RETRY_MS; a stalled reply costs at most HH_REPLY_MS per frame.
+#define HH_CONNECT_MS 300
+#define HH_RETRY_MS 3000
+#define HH_REPLY_MS 250
+
 static int g_sock = -1;
+static uint64_t g_hh_retry_at; // no connect attempt before this time
+static enum { HH_NEVER, HH_UP, HH_DOWN } g_hh_state; // to log each change once, not each attempt
 
 static void hh_close(void)
 {
     if (g_sock >= 0) { close(g_sock); g_sock = -1; }
 }
 
+static void hh_down(const char* why)
+{
+    hh_close();
+    if (g_hh_state != HH_DOWN) logmsg("HyperHDR %s:%d not available (%s); retrying", g_host, g_port, why);
+    g_hh_state = HH_DOWN;
+}
+
 static bool hh_connect(void)
 {
     hh_close();
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return false;
+    uint64_t t = now_ms();
+    if (t < g_hh_retry_at) return false;
+    g_hh_retry_at = t + HH_RETRY_MS;
     struct sockaddr_in a = { 0 };
     a.sin_family = AF_INET;
     a.sin_port = htons(g_port);
     if (inet_pton(AF_INET, g_host, &a.sin_addr) != 1) {
-        struct hostent* he = gethostbyname(g_host);
-        if (!he) { close(fd); return false; }
+        struct hostent* he = gethostbyname(g_host); // a name instead of an address: may block on DNS
+        if (!he) { hh_down("name not found"); return false; }
         memcpy(&a.sin_addr, he->h_addr_list[0], he->h_length);
     }
-    struct timeval tv = { 2, 0 };
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return false;
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+    int rc = connect(fd, (struct sockaddr*)&a, sizeof(a));
+    if (rc != 0 && errno == EINPROGRESS) {
+        struct pollfd pf = { fd, POLLOUT, 0 };
+        int err = ETIMEDOUT;
+        socklen_t len = sizeof(err);
+        if (poll(&pf, 1, HH_CONNECT_MS) > 0) getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len);
+        rc = err ? -1 : 0;
+        errno = err;
+    }
+    if (rc != 0) {
+        int e = errno;
+        close(fd);
+        hh_down(strerror(e));
+        return false;
+    }
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) & ~O_NONBLOCK);
+    struct timeval snd = { 1, 0 }, rcv = { 0, HH_REPLY_MS * 1000 };
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &snd, sizeof(snd));
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rcv, sizeof(rcv));
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-    if (connect(fd, (struct sockaddr*)&a, sizeof(a)) != 0) { close(fd); return false; }
     g_sock = fd;
-    logmsg("HyperHDR connected %s:%d", g_host, g_port);
+    g_hh_retry_at = 0;
     return true;
 }
 
+// Send one command line and read HyperHDR's one-line reply. False if the connection is
+// gone or HyperHDR refused the command ("success":false, logged once per connection).
 static bool hh_write(const char* buf, size_t n)
 {
+    static int refused_on = -1;
     size_t off = 0;
     while (off < n) {
         ssize_t w = send(g_sock, buf + off, n - off, MSG_NOSIGNAL);
         if (w <= 0) return false;
         off += (size_t)w;
     }
-    // drain the one-line reply (non-fatal if it times out)
     char tmp[512];
-    recv(g_sock, tmp, sizeof(tmp), 0);
-    return true;
+    ssize_t r = recv(g_sock, tmp, sizeof(tmp) - 1, 0);
+    if (r == 0) return false; // closed by HyperHDR
+    if (r > 0) {
+        tmp[r] = 0;
+        if (strstr(tmp, "\"success\":false")) {
+            if (refused_on != g_sock) {
+                tmp[strcspn(tmp, "\r\n")] = 0;
+                logmsg("HyperHDR refused the command: %.200s", tmp);
+                refused_on = g_sock;
+            }
+            return false;
+        }
+    }
+    return true; // a reply that is merely late is not an error
 }
 
 // Send a GRID_W x GRID_H RGB image as a PNG JSON image command.
@@ -318,7 +366,13 @@ static bool hh_send_image(const uint8_t* rgb, int w, int h)
         b64, g_priority, g_duration_ms);
     if (mn <= 0 || mn >= (int)sizeof(msg)) return false;
     if (g_sock < 0 && !hh_connect()) return false;
-    if (!hh_write(msg, (size_t)mn)) { hh_close(); return false; }
+    if (!hh_write(msg, (size_t)mn)) {
+        hh_down("connection lost or command refused");
+        g_hh_retry_at = now_ms() + 1000;
+        return false;
+    }
+    if (g_hh_state != HH_UP) logmsg("HyperHDR connected %s:%d", g_host, g_port);
+    g_hh_state = HH_UP;
     return true;
 }
 
@@ -494,17 +548,20 @@ static bool g_ui_ok;
 // 320x180, 20 Hz, measured with --profile), so every byte is fetched once, in 32-byte
 // groups of 64-bit loads. (NEON intrinsics would be wider but crash zig's backend for
 // the soft-float target.)
+typedef uint64_t __attribute__((may_alias)) u64_alias; // the pixels are read back as uint32_t
+typedef uint32_t __attribute__((may_alias)) u32_alias;
+
 static void copy_from_device(void* dst, const void* src, size_t n)
 {
-    const volatile uint64_t* s = src;
-    uint64_t* d = dst;
+    const volatile u64_alias* s = src;
+    u64_alias* d = dst;
     size_t i = 0, words = n / 8;
     for (; i + 4 <= words; i += 4) {
         uint64_t a = s[i], b = s[i + 1], c = s[i + 2], e = s[i + 3];
         d[i] = a; d[i + 1] = b; d[i + 2] = c; d[i + 3] = e;
     }
     for (; i < words; i++) d[i] = s[i];
-    if (n & 4) ((uint32_t*)dst)[n / 4 - 1] = ((const volatile uint32_t*)src)[n / 4 - 1];
+    if (n & 4) ((u32_alias*)dst)[n / 4 - 1] = ((const volatile u32_alias*)src)[n / 4 - 1];
 }
 
 static bool ui_open(void)
@@ -752,7 +809,7 @@ static void reconstruct(const double zm[16][3], int lb, double out[GRID_H][GRID_
         for (int c = 0; c < 3; c++) {
             double raw = 0;
             for (int z = 0; z < 16; z++) raw += R[k][z] * m[z][PROFILE_PERM[c]];
-            cell[k / PROFILE_COLS][k % PROFILE_COLS][c] = level_map(raw, c) * g_gain;
+            cell[k / PROFILE_COLS][k % PROFILE_COLS][c] = level_map(raw, c);
         }
 #if PROFILE_UPSAMPLE
     // bilinear 2x, pixel-centre aligned (the same resampling the calibration evaluated)
@@ -795,7 +852,8 @@ static void sample(double img[GRID_H][GRID_W][3], double fx, double fy, double o
 // Build the output image: reconstructed colours with the UI plane composited on top by
 // its alpha (in screen coordinates). With black bars the bars are then cropped and the
 // picture stretched to the full frame, so the top and bottom LEDs show the picture's
-// edges, and UI inside the bars (e.g. subtitles) no longer reaches the LEDs.
+// edges, and UI inside the bars (e.g. subtitles) no longer reaches the LEDs. The
+// brightness setting (g_gain) scales the final result, video and UI alike.
 // out is GRID_H*GRID_W*3 row-major RGB.
 static void compose(const double zm[16][3], const uint8_t urgb[GRID_H][GRID_W][3],
     const uint8_t ualpha[GRID_H][GRID_W], bool have_ui, uint8_t* out)
@@ -820,7 +878,7 @@ static void compose(const double zm[16][3], const uint8_t urgb[GRID_H][GRID_W][3
                 p[0] = comp[r][c][0]; p[1] = comp[r][c][1]; p[2] = comp[r][c][2];
             }
             uint8_t* o = &out[(r * GRID_W + c) * 3];
-            o[0] = clamp8(p[0]); o[1] = clamp8(p[1]); o[2] = clamp8(p[2]);
+            o[0] = clamp8(p[0] * g_gain); o[1] = clamp8(p[1] * g_gain); o[2] = clamp8(p[2] * g_gain);
         }
 }
 
@@ -903,6 +961,19 @@ static bool load_args_file(void)
     for (char* tok = strtok(buf, " \t\r\n"); tok && argc < 32; tok = strtok(NULL, " \t\r\n")) words[argc++] = tok;
     apply_args(argc, words);
     return true;
+}
+
+// The status file is only written while someone is watching: `ambilightctl json-status`
+// (the settings app polls it) touches <status-file>.want; without a recent touch nothing is
+// written, which saves a flash write every 2 s around the clock (measured: 180 MB/day).
+#define STATUS_WANT_S 15
+static bool status_wanted(void)
+{
+    if (!g_status_path[0]) return false;
+    char want[sizeof(g_status_path) + 8];
+    snprintf(want, sizeof(want), "%s.want", g_status_path);
+    struct stat st;
+    return stat(want, &st) == 0 && time(NULL) - st.st_mtime < STATUS_WANT_S;
 }
 
 // Write a small JSON status file (atomically) for the settings app.
@@ -1038,15 +1109,20 @@ static bool input_read(uint64_t t)
 }
 
 // Sleep until `deadline`, handling remote input meanwhile. Returns early (true) when the
-// toggle key was pressed, so the response is immediate.
+// toggle key was pressed, so the response is immediate. Input is read at least once even
+// when the loop is already past its deadline, so the key keeps working under load.
 static bool wait_until(uint64_t deadline)
 {
     for (;;) {
         uint64_t t = now_ms();
-        if (t >= deadline || g_stop || g_reload) return false;
-        int ms = (int)(deadline - t);
-        if (!g_nin) { usleep((useconds_t)ms * 1000); return false; }
+        int ms = t < deadline ? (int)(deadline - t) : 0;
+        if (!g_nin) {
+            if (ms && !g_stop && !g_reload) usleep((useconds_t)ms * 1000);
+            return false;
+        }
+        if (g_stop || g_reload) ms = 0;
         if (poll(g_in, (nfds_t)g_nin, ms) > 0 && input_read(now_ms())) return true;
+        if (ms == 0) return false;
     }
 }
 
@@ -1112,8 +1188,9 @@ int main(int argc, char** argv)
     unsigned frames = 0, holds = 0, reopens = 0;
     uint64_t max_gap = 0, total_gap = 0; // gap = ms between losing and regaining colour
     uint64_t t_log = now_ms();
-    uint64_t t_status = 0;
+    uint64_t t_status = 0, t_written = 0;
     unsigned frames_at_status = 0;
+    double fps = 0;
     bool hh_ok = false;
     int rc = 0;
     uint64_t t_self = now_ms();
@@ -1153,12 +1230,16 @@ int main(int argc, char** argv)
             reset_user_settings();
             if (!load_args_file()) logmsg("reload: cannot read %s, using defaults", g_args_path);
             if (old_prio != g_priority) { // release the old priority on HyperHDR first
-                int p = g_priority;
+                int new_prio = g_priority;
                 g_priority = old_prio;
                 hh_clear();
-                g_priority = p;
+                g_priority = new_prio;
             }
-            if (strcmp(old_host, g_host) || old_port != g_port) hh_close();
+            if (strcmp(old_host, g_host) || old_port != g_port) {
+                hh_close();
+                g_hh_retry_at = 0; // try the new address at once
+                g_hh_state = HH_NEVER;
+            }
             if (!g_lb_enabled) g_lb_level = 0;
             if (old_key != g_toggle_key) {
                 g_in_rescan = true;
@@ -1199,7 +1280,9 @@ int main(int argc, char** argv)
             prev_ok = true;
             have_colour = true;
             if (g_calib) calib_dump_hist(t);
-            if (g_preset == 0) lb_update(t); // bars are only visible to the full-frame preset
+            // bars are only visible to the full-frame preset; not while paused, when the UI
+            // plane is not read and a dark menu could pass for bars
+            if (g_preset == 0 && !g_paused) lb_update(t);
         } else if (g_hist) {
             // handle was revoked mid-stream: drop it and start re-acquiring at once
             hist_close();
@@ -1254,10 +1337,13 @@ int main(int argc, char** argv)
         }
 
         if (t - t_status >= 2000) {
-            double fps = t_status ? (frames - frames_at_status) * 1000.0 / (double)(t - t_status) : 0;
-            write_status(g_hist ? "open" : "waiting", fps, reopens, max_gap, hh_ok);
+            fps = t_status ? (frames - frames_at_status) * 1000.0 / (double)(t - t_status) : 0;
             t_status = t;
             frames_at_status = frames;
+        }
+        if ((!t_written || t - t_written >= 2000) && status_wanted()) {
+            write_status(g_hist ? "open" : "waiting", fps, reopens, max_gap, hh_ok);
+            t_written = t;
         }
         if (t - t_log >= (uint64_t)g_status_ms) {
             logmsg("frames=%u holds=%u reopens=%u hist=%s policy=%d maxgap=%llums totalgap=%llums%s", frames, holds,

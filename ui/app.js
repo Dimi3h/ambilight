@@ -35,12 +35,21 @@
       lunaSub(uri, params, function (r, err) { if (err) reject(err); else resolve(r); return true; });
     });
   }
+  // Homebrew Channel reports a non-zero exit as returnValue:false with "Command failed: …";
+  // ambilightctl then still explains itself as JSON on stdout, which is what we want to show.
   function exec(cmd) {
     return luna(HB + 'exec', { command: cmd }).then(function (r) {
-      if (!r.returnValue) throw new Error(r.errorText || r.stderrString || 'exec failed');
-      return r.stdoutString || '';
+      var out = r.stdoutString || '';
+      if (!r.returnValue && !/^\s*\{/.test(out)) throw new Error((r.stderrString || '').trim() || 'opdracht mislukt');
+      return out;
     });
   }
+  var ERRORS = { // ambilightctl's messages, for the viewer
+    'feed not reachable': 'GitHub is niet bereikbaar',
+    'package not in feed': 'de updatelijst is onvolledig',
+    'invalid host': 'ongeldig adres', 'invalid port': 'ongeldige poort',
+    'invalid priority': 'ongeldige prioriteit', 'invalid gain': 'ongeldige helderheid'
+  };
   var ctl = onTv ? function (args) { return exec(CTL + ' ' + args); } : mockCtl();
 
   // Install an IPK through Homebrew Channel; onStatus gets "Downloaden… 40%" etc.
@@ -219,7 +228,7 @@
       }
       if (okMsg) toast(typeof okMsg === 'function' ? okMsg(r) : okMsg);
       return r;
-    }).catch(function (e) { toast('Fout: ' + e.message, true); })
+    }).catch(function (e) { toast('Fout: ' + (ERRORS[e.message] || e.message), true); })
       .then(function (r) { busy = false; return refresh().then(function () { return r; }); });
   }
   function setValue(key, value, msg) { return run('set ' + key + '=' + value, msg || 'Opgeslagen'); }
@@ -253,7 +262,8 @@
     hbInstall(u.ipkUrl, u.sha256, function (status) { installing = status; renderUpdate(); }).then(function () {
       installing = null;
       toast('Versie ' + u.latest + ' geïnstalleerd · Ambilight herstart vanzelf');
-      setTimeout(refresh, 8000);
+      // this page is still the old version: load the new one once the service is back
+      setTimeout(function () { window.location.reload(); }, 9000);
     }).catch(function (e) {
       installing = null;
       toast('Update mislukt: ' + e.message, true);

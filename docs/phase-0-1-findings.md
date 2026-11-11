@@ -435,3 +435,61 @@ opaque) and cross-checked with `/proc/<pid>/stat`:
   fixed mtime (deterministic IPK), so the inode is what identifies a new version.
 - Not exercised on the TV: removal through Homebrew Channel's Uninstall (the code path
   removes the boot hook and stops) and the GitHub feed itself (no release published yet).
+
+## Review (2026-11-11) and version 0.2.1
+
+A full read-through of the code, scripts, app, build and release, with each suspicion
+checked by a test or a read-only measurement on the TV.
+
+### Open: the capture resource is taken every ~122 s
+
+- The service log of one night shows 33 histogram revocations, ~1.4 s each (1.3–1.8 s),
+  exactly 122 s apart. The first came 9 s after the app `space.nuvio.webos` (a third-party
+  streaming app) was started for the first time; they continued in that app, on the home
+  screen and after a standby/wake, and stopped when the power state changed to "Screen
+  Saver". In the 38 active minutes before that app start there were none. Extra short
+  losses (10–15 ms) appeared at app switches and at standby.
+- The caller is unknown. No homebrew package on the TV uses the capture service (only
+  PicCap's files mention it, and it was not running). LG components with a capture
+  permission in the Luna configuration: `com.webos.service.gibbs` (broadcast),
+  `legacybroadcast-*`, `com.webos.service.objectdetection`; a `com.webos.service.acr`
+  service exists. Live Plus and the AI picture options were off.
+- Consequences: (1) with clear content the LEDs hold their colours for ~1.4 s every two
+  minutes; (2) during protected playback the handle cannot be re-opened, so one such grab
+  would freeze the colours until playback ends. The longest protected run measured so far
+  (Disney+, 2026-11-10) lasted ~100 s, i.e. less than one period: **colours during a whole
+  protected film are unproven.**
+- To do: watch the Luna bus (`ls-monitor`) for calls to `com.webos.service.capture` while it
+  happens; a 10-minute protected run with the log; and measure whether the histogram's
+  policy callback can refuse the revocation by returning false (never measured; it returns
+  true today).
+
+### Fixed in 0.2.1
+
+- **Brightness did not apply to the UI layer** (unit test: an opaque white UI stayed at 255
+  with gain 0.15; now 38). The gain is applied to the composed image.
+- **HyperHDR unreachable**: connect waited up to 2 s on every frame and the remote key was
+  only read when the loop had time left. Now a 0.3 s connect attempt every 3 s and input is
+  always read. Measured with an unused address: the loop keeps its rate (4.7 % CPU as in
+  normal operation), one log line for the outage, a pause is applied within the second.
+- **Flash writes**: `status.json` every 2 s cost 127 kB/min of dirtied pages (measured in
+  `/proc/<pid>/io`, ≈180 MB/day; the eMMC's wear indicator reads 0x01, the lowest level).
+  It is now written only while `json-status` asks (a `.want` marker, 15 s): 4 kB per 30 s
+  without the app, and `json-status` still returns a fresh status in 0.26 s.
+- `ambilightctl stop`'s emergency path matched itself (`pkill -f` on a path prefix); tested
+  with a frozen (SIGSTOP) service: now ends it and returns 0. `setup` keeps a pause
+  (verified through an upgrade and a stop/setup cycle). The boot counter resets after 20 s
+  (verified: 2 → 0 between 12 s and 24 s after start).
+- Homebrew Channel's `exec` reports a non-zero exit as `returnValue:false` with
+  "Command failed: …" but still returns stdout; the app now shows ambilightctl's own
+  message. The app reloads after an update (not yet seen on the TV).
+- The copy loop's type punning is now declared (`may_alias`); the generated code was already
+  identical with and without strict aliasing. The binary is stripped (951 kB → 111 kB,
+  `printLog` still exported). Actions are pinned to commit hashes.
+
+### Not verified
+
+- Brightness end to end on the TV (the screen was black in the screensaver during the
+  check; HyperHDR's LED stream read 0 either way).
+- The app's new error text and reload, and the timing of the remote key under load (the
+  loop rate was measured, the key itself not pressed).

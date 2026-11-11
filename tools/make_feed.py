@@ -39,7 +39,7 @@ def notes_for(version, changelog="CHANGELOG.md"):
         return f"Ambilight {version}\n"
     m = re.search(rf"^## {re.escape(version)}\b.*?$(.*?)(?=^## |\Z)", text, re.M | re.S)
     body = m.group(1).strip() if m else ""
-    return (body or f"Ambilight {version}") + f"\n\nInstall or update through Homebrew Channel: see the README.\n"
+    return (body or f"Ambilight {version}") + "\n\nInstall or update through Homebrew Channel: see the README.\n"
 
 
 def main():

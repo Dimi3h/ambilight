@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.2.1
+
+Fixes from a full review of the project.
+
+- Brightness now scales everything sent to the LEDs. It used to leave the UI layer (menus,
+  home screen) at full level.
+- HyperHDR not reachable (Pi off): the service no longer stalls up to 2 s per frame; it
+  tries to connect for at most 0.3 s every 3 s, logs the outage once, and the remote key and
+  the settings app keep responding. A command HyperHDR refuses is logged.
+- The remote key is read even when the loop is behind schedule.
+- `status.json` is only written while the settings app (or `ambilightctl json-status`) asks
+  for it: no more flash write every 2 s around the clock.
+- `ambilightctl stop` could kill itself in its emergency path; `setup` (used by upgrades)
+  now keeps a pause; black-bar detection no longer runs while paused.
+- The boot-loop guard counts a boot as stable after 20 s instead of 60 s, so three short TV
+  sessions in a row no longer switch ambilight off.
+- Settings app: readable error messages; reloads itself after installing an update.
+- Package four times smaller (no debug info). GitHub Actions pinned to commits; CI runs once
+  per change; more unit tests (brightness, PNG encoder, update feed).
+- New `tools/ledtest.py`: dim test colours and an edge pattern for a real LED strip.
+
 ## 0.2.0
 
 - Install and update through Homebrew Channel: add the feed
