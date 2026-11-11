@@ -493,3 +493,63 @@ checked by a test or a read-only measurement on the TV.
   check; HyperHDR's LED stream read 0 either way).
 - The app's new error text and reload, and the timing of the remote key under load (the
   loop rate was measured, the key itself not pressed).
+
+### Cause of the 122 s losses (2026-11-11, later)
+
+Watched the Luna bus (`ls-monitor -f com.webos.service.capture`, 150 s) while it happened:
+
+- `com.webos.service.oledepl` (OLED panel care) calls `executeOneShot` with method `GRAPHIC`
+  every 3 s. That captures the UI plane only and does **not** disturb the histogram.
+- `com.webos.surfacemanager` calls `executeOneShot` to `/tmp/snapshots/<id>/<app>_tmp_sc…`
+  with method `BLENDED` (video + UI). The call at 9388.26 s returned `ERROR_INTERNAL` at
+  9390.10 s; the histogram was lost exactly in that window (recovered at 9390.105 s after
+  1721 ms). This is the caller.
+- Its code (`WebOSCompositor/controllers/StarfishFullscreenController.qml`,
+  `fullscreen/StarfishFullscreenCapture.qml`): a screenshot of the foreground app for the
+  recents list, `fullscreenFocusCaptureTimeout` (2 s) after the app is ready
+  (`fullscreenReadyTimeout` 5 s) and then every `fullscreenCaptureTimeout` (120 s). It is
+  skipped when the config `com.webos.surfacemanager.disableCapture` is true (false here; set
+  in LG's `hd1080-lite/mini` and `hd2160-lite/mini` configd layers), when
+  `compositor.needScreenCapture(item)` says no (C++, not read), or when the app declares
+  `imageForRecents` in its appinfo.
+- `imageForRecents` on this TV: Netflix, Amazon (Prime Video) and YouTube declare it;
+  Disney+, Apple TV, VRT MAX, VTM GO, Play, the browser, Live TV, HDMI, the home screen,
+  Homebrew Channel, Nuvio and our own settings app do not. That fits the observations: no
+  periodic losses in yesterday's YouTube runs, losses with Nuvio and on the home screen.
+- Still unmeasured: whether the screenshot is attempted (and revokes the histogram) while
+  Disney+ plays protected content; and whether `setConfigs` can switch `disableCapture` on,
+  whether that survives a reboot, and whether it also removes the capture at app switches
+  (the controller checks the same flag there).
+
+### LG's `disableCapture` switch, measured (2026-11-11)
+
+- Baseline in the same session (TV active, one third-party player in the foreground the
+  whole time): losses every ~121 s, the last two at 4516.8 s and 4638.8 s.
+- `luna://com.webos.service.config/setConfigs {"configs":{"com.webos.surfacemanager.disableCapture":true}}`
+  at 4659 s returned `returnValue:true`; `getConfigs` read `true`.
+- Next 360 s (4671–5031 s) on the Luna bus: 119 `GRAPHIC` calls from
+  `com.webos.service.oledepl`, **no** call from `com.webos.surfacemanager`. The service
+  logged **no** loss in that window (expected without the switch: ~4760, ~4882, ~5004 s);
+  `reopens` stayed at 42, `hist=open`.
+- Restored to `false` afterwards (read back). configd keeps such overrides in
+  `/var/preferences/configd_factory_db.json` as a "usrDefined" entry, so the value is
+  expected to survive a reboot (not tested); after the test that file holds the key with its
+  default value `false`. configd also drops a `before_setConfigs` snapshot of its
+  configuration in `/tmp` on every set.
+- Not measured: a reboot with the switch on; whether the capture at app switches disappears
+  too; a long protected run in Disney+ with the switch on.
+
+### `disableCapture` switched on for good on this TV (2026-11-11)
+
+At the owner's request the config was set to `true` at uptime 7030 s (read back `true`; the
+override is in `/var/preferences/configd_factory_db.json`). It is a setting of this TV, not
+something the package does: installing ambilight elsewhere does not change it, and
+`tools/uninstall.sh` does not put it back. To undo it:
+
+```sh
+luna-send -n 1 luna://com.webos.service.config/setConfigs '{"configs":{"com.webos.surfacemanager.disableCapture":false}}'
+```
+
+Still to observe in normal use (the service log shows it, also while paused): that the
+value survives a reboot, whether the short losses at app switches are gone, and a long
+protected Disney+ run without a loss (`reopens` not increasing, never `hist=lost-slow`).

@@ -199,12 +199,17 @@ rm -rf /media/developer/ambilight
   LG's own capture service briefly takes the capture resource on some app switches; if
   that happens right as protected playback starts, the last colours are held until a
   clear moment (menu, pause, next app).
-- **Open question (measured 2026-11-11):** after a third-party streaming app was started,
-  something on the TV took the capture resource every ~122 s for ~1.4 s (the LEDs hold their
-  colours meanwhile), also on the home screen, until the screensaver started. The caller is
-  not identified yet. During protected playback such a loss cannot be repaired, and the
-  longest protected run measured so far was ~100 s: colours during a whole film are
-  unproven. See the findings.
+- **Periodic 1.5 s hold (cause found 2026-11-11):** LG's surface-manager takes a
+  screenshot of the foreground app for its "recent apps" list shortly after the app starts
+  and then every 120 s. That screenshot takes the capture resource for ~1.5 s, during which
+  the LEDs hold their colours. Apps that ship their own recents image (`imageForRecents`:
+  Netflix, Prime Video, YouTube) are not captured; others are (measured: the home screen and
+  a third-party player; Disney+, Apple TV and the Belgian broadcasters' apps do not declare
+  it either). During protected playback such a loss cannot be repaired, and the longest
+  protected run measured so far was ~100 s: colours during a whole film in those apps are
+  unproven. LG has a switch for these screenshots (`com.webos.surfacemanager.disableCapture`).
+  Measured: with it on, the screenshots and the losses stop at once; it is not built into
+  the service yet. See the findings.
 - The white point in the profile was measured in the picture mode "cinema"; other modes,
   HDR and Dolby Vision are not calibrated and may tint the LEDs.
 - Calibration (`src/profile_b4.h`, `src/letterbox_b4.h`) is for the B4 on this firmware;
