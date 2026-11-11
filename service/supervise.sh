@@ -23,6 +23,8 @@ log() {
 # after Homebrew Channel's startup failsafe window, with Luna and media services up
 [ "$1" = boot ] && sleep 30
 
+"$SVC_DIR/ambilightctl" migrate > /dev/null 2>&1 # settings from an older version
+
 fast=0
 while [ ! -e "$STATE/disable" ]; do
     started=$(date +%s)

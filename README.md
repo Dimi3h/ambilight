@@ -83,8 +83,8 @@ Open **Ambilight** from the TV's app list. With the remote (▲▼ choose, OK ch
 - switch ambilight on or off (off stays off across reboots; the service keeps running with
   the LEDs off and the histogram open, so protected content has colours again at once when
   you switch back on);
-- let the remote's **blue key** switch ambilight on and off (a short on-screen message
-  confirms it);
+- use the remote's **colour keys**: blue switches ambilight on and off, green dims and
+  yellow brightens in steps of 10 % (a short on-screen message confirms it);
 - set the HyperHDR address, port and priority;
 - adjust brightness (10–300 %; it scales everything sent to the LEDs, picture and menus);
 - switch black-bar detection and UI blending (menus, subtitles) on or off;
@@ -93,11 +93,13 @@ Open **Ambilight** from the TV's app list. With the remote (▲▼ choose, OK ch
   autostart, version, recent log lines, and the reason if an emergency brake switched it
   off.
 
-The blue key is read passively from the remote's input devices (never grabbed): the TV
-receives it as always. On the home screen it does nothing (measured: no app launch, no key
-filter action); apps that use colour keys (teletext, HbbTV) still get it as well. Why the blue key and not a
-dedicated button such as LG Channels: see the findings (LG re-applies its button table from
-its server at every boot).
+The colour keys are read passively from the remote's input devices (never grabbed): the TV
+receives them as always, and apps that use colour keys (teletext, HbbTV) still get them as
+well. Only short presses are used, because LG gives its own meaning to two long gestures:
+holding yellow for 5 s starts an LG test-pattern function, and seven quick presses of green
+on an HDMI input show LG's FreeSync information. Why colour keys and not a dedicated button
+such as LG Channels: see the findings (LG re-applies its button table from its server at
+every boot).
 
 Changes apply immediately, without restarting the service. The app runs
 `ambilightctl` through Homebrew Channel's public `exec` method; every value is checked
@@ -113,7 +115,7 @@ $C pause | resume         # LEDs off / on, the service keeps running (what the a
 $C stop                   # service off, stays off across reboots
 $C start                  # on again (also clears the guards below and a pause)
 $C set gain=1.2 uiblend=off   # change settings live: host, port (1-65535), priority (1-253),
-                              # gain (0.1-3.0), letterbox|uiblend|bluekey on|off
+                              # gain (0.1-3.0), letterbox|uiblend|colorkeys on|off
 $C json-status            # everything as JSON (used by the settings app)
 $C check-update           # read the release feed now
 $C setup                  # elevate + boot hook + start (the app runs this on first start)
