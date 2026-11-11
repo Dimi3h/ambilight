@@ -32,8 +32,10 @@ while [ ! -e "$STATE/disable" ]; do
         --pause-file "$STATE/paused" --maintain < /dev/null > /dev/null 2>&1 9>&- &
     pid=$!
     echo "$pid" > "$STATE/service.pid"
-    # running for 60 s counts as a stable boot: reset the boot-loop guard
-    (sleep 60 && kill -0 "$pid" 2> /dev/null && echo 0 > "$STATE/boot-attempts" && sync) 9>&- &
+    # running for 20 s counts as a stable boot: reset the boot-loop guard. (A service that
+    # brought the TV down would do so within seconds of opening the capture interfaces; a
+    # longer window only makes three short TV sessions in a row trip the guard.)
+    (sleep 20 && kill -0 "$pid" 2> /dev/null && echo 0 > "$STATE/boot-attempts" && sync) 9>&- &
     wait "$pid"
     rc=$?
     if [ -e "$STATE/disable" ]; then

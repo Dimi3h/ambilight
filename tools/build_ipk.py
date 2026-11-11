@@ -12,7 +12,6 @@ import gzip
 import io
 import os
 import tarfile
-import time
 
 MTIME = 1700000000
 

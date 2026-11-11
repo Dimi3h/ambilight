@@ -5,7 +5,7 @@
 # Emergency brakes - any one of them leaves the TV booting exactly as without ambilight:
 #   1. package missing                -> do nothing (run-parts skips a dangling symlink)
 #   2. $STATE/disable exists           -> do nothing (manual off switch; 3 and 4 write it too)
-#   3. boot-loop guard: 3 boots in a row without the service reaching a stable 60 s
+#   3. boot-loop guard: 3 boots in a row without the service reaching a stable 20 s
 #      -> write $STATE/disable and stop starting it
 #   4. crash-loop guard (supervise.sh): 5 exits within 60 s each -> $STATE/disable
 # Homebrew Channel's own failsafe still applies: a reboot during its startup window skips
