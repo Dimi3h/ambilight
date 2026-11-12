@@ -16,7 +16,10 @@ Steps:
   4. derive each zone's footprint A[z][k] over the 16x9 cells;
   5. build reconstruction operators R (cells x zones) and evaluate them on the
      validation images exactly as HyperHDR will see them (mean over each LED rectangle);
-  6. write the best operator and the level map to a C header.
+  6. evaluate the non-negative solve the service uses for 16:9 pictures (same model, cells
+     >= 0, solved per frame) on the same images;
+  7. write the best operator, the footprints for the non-negative solve and the level map
+     to a C header.
 Pure Python (no numpy); the linear systems are small.
 """
 import bisect
@@ -31,6 +34,52 @@ SETTLE_MS = 150
 UW, UH = 32, 18          # UI ground-truth grid
 GW, GH = 16, 9           # calibration / reconstruction grid
 NZ = 16
+NNLS_LAMBDA = 0.001      # smoothness weight of the non-negative solve
+NNLS_CLEAN = 0.15        # footprint entries below this share of a zone's strongest cell are dropped
+NNLS_BLACK = 0.25        # a zone mean below this (raw levels above black) is a black zone
+
+
+def clean_footprints(An):
+    """Footprints for the non-negative solve: weak entries are measurement residue (a zone
+    answering 0.1-0.5 % to cells far outside its rectangle); with them a dark zone could no
+    longer force its cells to black. Rows are renormalised to 1."""
+    out = []
+    for row in An:
+        mx = max(row)
+        kept = [v if v >= NNLS_CLEAN * mx else 0.0 for v in row]
+        t = sum(kept)
+        out.append([v / t for v in kept])
+    return out
+
+
+def nnls_cells(Ac, h, lam, sweeps=150):
+    """min ||Ac x - h||^2 + lam * x'Lx, x >= 0, by coordinate descent (what src/ambilight.c does).
+    Cells of a zone that reads black (h < NNLS_BLACK) are black and left out of the smoothness term."""
+    n = GW * GH
+    nb = [[] for _ in range(n)]
+    for y in range(GH):
+        for x in range(GW):
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                if 0 <= x + dx < GW and 0 <= y + dy < GH:
+                    nb[y * GW + x].append((y + dy) * GW + x + dx)
+    cols = [[(z, Ac[z][k]) for z in range(NZ) if Ac[z][k]] for k in range(n)]
+    black = [not cols[k] or any(h[z] < NNLS_BLACK for z, _ in cols[k]) for k in range(n)]
+    free = [[j for j in nb[k] if not black[j]] for k in range(n)]
+    diag = [sum(w * w for _, w in cols[k]) + lam * len(free[k]) for k in range(n)]
+    x = [0.0] * n
+    r = list(h)
+    for _ in range(sweeps):
+        for k in range(n):
+            if black[k]:
+                continue
+            g = sum(w * r[z] for z, w in cols[k]) - lam * (len(free[k]) * x[k] - sum(x[j] for j in free[k]))
+            nx = max(0.0, x[k] + g / diag[k])
+            d = nx - x[k]
+            if d:
+                x[k] = nx
+                for z, w in cols[k]:
+                    r[z] -= w * d
+    return x
 
 
 # ------------------------------------------------------------------ parsing
@@ -325,6 +374,24 @@ def main():
         for up in (False, True):
             e = evaluate(R, up); results.append((e, f"least-squares lam={lam:g}", up, R))
             print(f"  least-squares lam={lam:<9g}        up={int(up)}  MAE {e:6.2f}")
+    # The non-negative solve (used by the service for 16:9 pictures): same model, but no cell
+    # may go below black, so a zone that reads black keeps its cells dark.
+    Ac = clean_footprints(An)
+    def nnls_eval(lam):
+        err = 0.0; n = 0
+        for (f, m), gt in zip(main_val, gts):
+            cell = [[0.0, 0.0, 0.0] for _ in range(GW * GH)]
+            for c in range(3):
+                x = nnls_cells(Ac, [max(0.0, m[z][perm[c]] - lvl_black[c]) for z in range(NZ)], lam)
+                for k in range(GW * GH):
+                    cell[k][c] = to_ui(x[k] + lvl_black[c], c)
+            img = upsample2(cell, GW, GH)
+            for l, g in zip(leds, gt):
+                e = rect_mean(img, 2 * GW, 2 * GH, l)
+                err += sum(abs(a - b) for a, b in zip(e, g)); n += 3
+        return err / n
+    nnls_mae = nnls_eval(NNLS_LAMBDA)
+    print(f"  non-negative solve lam={NNLS_LAMBDA:g}, cleaned footprints, up=1  MAE {nnls_mae:6.2f}")
     # Negative weights amplify read-to-read histogram noise (the double-buffered reads
     # alternate by a few units on moving video). Noise gain = largest row L1 norm.
     gain = lambda R: max(sum(abs(x) for x in row) for row in R)
@@ -359,6 +426,14 @@ def main():
         f.write(f"static const float PROFILE_R[{GW * GH}][16] = {{\n")
         for row in best_R:
             f.write("    {" + ", ".join(f"{x:.5f}f" for x in row) + "},\n")
+        f.write("};\n")
+        f.write("// Non-negative solve (16:9 pictures): zone_mean - black = sum_k PROFILE_A[zone][k] * cell[k], cell >= 0,\n")
+        f.write(f"// smoothness weight PROFILE_NNLS_LAMBDA. Validation MAE {nnls_mae:.2f}/255. Footprints below "
+                f"{NNLS_CLEAN:g} of a zone's\n// strongest cell are dropped, rows sum to 1.\n")
+        f.write(f"#define PROFILE_NNLS_LAMBDA {NNLS_LAMBDA:g}f\n")
+        f.write(f"static const float PROFILE_A[16][{GW * GH}] = {{\n")
+        for row in Ac:
+            f.write("    {" + ", ".join("0" if x == 0 else f"{x:.6f}f" for x in row) + "},\n")
         f.write("};\n")
     print("wrote", out_h)
 

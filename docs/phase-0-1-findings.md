@@ -566,3 +566,244 @@ protected Disney+ run without a loss (`reopens` not increasing, never `hist=lost
 - Hence: only key-down events count, no hold-to-repeat; one press is 10 percentage points
   (10–300 %). The message and the write to the settings file follow 0.6 s and 1.2 s after
   the last press, so a burst gives one toast and one write.
+
+### First light on the real strip (2026-11-11)
+
+Strip still on its reel (SK6812 RGBW, 60/m, 300 LEDs; HyperHDR configured for 210), fed at
+the start only, ambilight paused, test patterns from `tools/ledtest.py` at level 64 (HyperHDR
+gamma 1.5 on top):
+
+- HyperHDR switches its LED device component off while no source is active and on again as
+  soon as one is (seen in `serverinfo`: `LEDDEVICE` false → true when the test colour started).
+- Dim red: the owner saw dim red on most of the strip, the last part dark. So data, power
+  and the red channel are right, and the LEDs beyond the configured 210 stay off.
+- Edge pattern: red, green, blue, yellow in that order from the plug, short-long-short-long
+  with dark LEDs in between, as predicted from HyperHDR's layout. So the configured byte
+  order (GRB) is right for all three colours and the layout runs left, top, right, bottom
+  from the data input. No flicker reported.
+- Not tested yet: the white channel, brightness above this dim level, the voltage drop along
+  the unrolled strip, and real picture content.
+
+### Strip mounted on the TV (2026-11-11)
+
+Stuck about 1 cm from the edge on the thin panel (sides, top) and along the bottom of the
+thick part, corners folded on pad rows with tape underneath, no soldering. Start at the
+bottom-left as seen from the front (bottom-right from behind), running up. Counted by the
+owner, every LED in chain order, fold LEDs counted with the piece that ends in the fold:
+
+| piece | LEDs | chain index |
+| --- | --- | --- |
+| left side, up (ends in fold 1) | 39 | 1–39 |
+| top, left to right (ends in fold 2) | 73 | 40–112 |
+| right side, down (ends in fold 3) | 41 | 113–153 |
+| bottom, right to left | 75 | 154–228 |
+
+In the bottom piece: 1 LED, 2 on the step from the thin panel onto the thick part
+(155–156), 69 on the thick part, 2 on the step back (226–227), 1 next to the start (228).
+HyperHDR classic layout for this: top 73, bottom 75, left 39, right 41, input position
+189 (= top + right + bottom), direction not reversed. Still to do: confirm with test
+patterns, find the LED hidden in each fold (among 38–39, 111–112, 152–153) and disable
+those and the step LEDs in HyperHDR.
+
+### Mounted strip verified (2026-11-11)
+
+HyperHDR set to the layout above (228 LEDs; `serverinfo` shows the runs left 39, top 73,
+right 41, bottom 75 from the data input).
+
+- Dim red on everything: every LED lit up to the last one next to the start, steady while
+  the three folds and the creased spot were moved by hand.
+- Edge pattern, close-ups of all four corners and a photo from the front: red left, green
+  top, blue right, yellow bottom (front view); the colours change exactly where predicted
+  (first red LED is 4, first green 43, first blue 116, first yellow 157, last yellow 225).
+  At each fold five of the six dark LEDs are visible. On the wall, 20 cm behind the TV, the
+  glow is wide and even, no single LEDs visible.
+- The LED hidden in each fold is the last one of its piece: **39, 112, 153**. Confirmed with
+  HyperHDR's identify command (`leddevice` / `identify`, `ledDeviceType: "blink"`,
+  `params.blinkIndex`, counted from 0), which addresses one LED directly and needs no
+  authorisation here: all three light only from under their fold. The image-based
+  single-LED pattern cannot show this cleanly, because the corner LEDs' areas overlap.
+- HyperHDR's editor counts from 0: the LEDs to disable are 38, 111, 152 (hidden) and
+  154, 155, 225, 226 (on the steps onto and off the thick part) in its numbering.
+- Yellow (equal red and green) looks greenish on camera only; by eye it is right (see below).
+
+### Disabled LEDs, white channel, load and first real content (2026-11-11)
+
+- **Disabling LEDs in HyperHDR's editor.** Five of the seven lie under another LED's area in
+  the preview (corner LEDs overlap; later LEDs are drawn on top, and LEDs 0-2 on top of
+  everything). The editor's own way out, from `light_source.js` on 22.0.0: hold Ctrl while
+  right-clicking and it takes the LED under the top one. Each toggle is written to the
+  configuration at once. `serverinfo` afterwards: exactly 38, 111, 152, 154, 155, 225, 226
+  (counted from 0) carry `disabled`, the geometry is unchanged.
+- **A solid colour ignores the disabled flag, an image respects it.** HyperHDR's LED stream
+  for the `color` command shows all 228 LEDs lit; for an `image` of the same colour exactly
+  the seven are black. Seen on the strip as well: the four LEDs on the steps stayed lit with
+  `color` and went dark with the image. Ambilight sends images, so it is not affected;
+  `ledtest.py color` now sends an image too.
+- **White channel.** Neutral white (equal R, G, B) lights only the white die of each LED;
+  on the wall it is neutral and the same at both ends of the chain.
+- **Load, fed at the start only.** White at level 192 and 255, then cyan, yellow and magenta
+  (two colour channels each, the heaviest case when white goes to the white die) at 192 and
+  255, 20 s per colour, two to three minutes per step. At every step the end of the chain
+  looked the same as the beginning, and the start connector, its thin wires and the supply
+  did not get noticeably warm. Current was not measured. Conclusion: with HyperHDR's
+  present settings (`scaleOutput` 1, `powerLimit` 1) a second feed at the end is not needed;
+  repeat the test if the output is ever scaled up. Full white is as bright as the user wants
+  it at most, and the three colours look right by eye.
+- **Thick part.** The glow under the TV is as even as on the other sides: no separate trim
+  for the bottom LEDs.
+- **Real content.** Ambilight resumed: 19.9 fps, colours on the matching sides, follows
+  video smoothly. The colour keys work with the LEDs: the log shows the brightness going
+  from 100 % to 20 % and back in 10-point steps, then a pause and resume with blue. This
+  also covers the 0.2.1 brightness fix end to end. 10 928 frames with `holds=0 reopens=0`;
+  `disableCapture` still reads true.
+- Still open: a run of ten minutes or more on Disney+, `disableCapture` after a full reboot,
+  removal through Homebrew Channel and the first-start setup.
+
+## Delay, and the histogram's three measurement states (2026-11-12)
+
+The user asked for less delay between picture and light.
+
+### Where the delay came from
+
+- The service sampled every 50 ms and averaged each read with the previous one: on
+  average 25 ms (age of that mean) + 25 ms (a frame is held until the next one) = about
+  50 ms before HyperHDR.
+- HyperHDR then smooths. Its settings cannot be read without the admin login; the
+  component can be switched at run time through the JSON API (`componentstate`,
+  `SMOOTHING`, no login needed, not persistent).
+- By eye: smoothing off made the delay "probably shorter" but the light restless; 40
+  reads a second on top made the delay "no longer disturbing" but the flicker "disturbing".
+
+### Three measurement states
+
+`getHistogram` does not return one stable measurement of a still picture but cycles
+through **three**, e.g. zone 1 blue = 53.72 / 54.87 / 56.30 on a paused YouTube frame
+(all channels of a zone move together; at level 15 the spread is about 10 %). Measured
+with the new `--hist-probe` mode (microsecond timestamps, a hash of every block returned):
+
+- Reads back to back (0.7 ms apart) alternate between two blocks; about every 8.4 ms
+  (one frame of the 120 Hz panel) one of the two is replaced. A read never returns the
+  block the previous read returned.
+- Reads exactly one frame (8.33 ms) apart returned the three states in strict rotation
+  (149 of 149). At 4.17 ms the pattern is `C A B A`, at 6 and 10 ms irregular.
+- Bursts started at random moments, error of the burst mean against the mean of the
+  three states (levels of 255, 80 bursts each):
+
+| reads per burst | all three states | mean error | max |
+| --- | --- | --- | --- |
+| 1 | – | 0.84 | 1.34 |
+| 2, one frame apart | – | 0.44 | 0.67 |
+| **3, 8.33 ms apart** | **91 %** | **0.05** | 0.86 |
+| 3, 8.70 ms apart | 94 % | 0.05 | 0.86 |
+| 2 back to back + 1 a frame later | 90 % | 0.06 | 0.86 |
+| 3, 10 ms apart | 82 % | 0.11 | 0.86 |
+| 4, 4.17 ms apart | 99 % (one twice) | 0.27 | 0.62 |
+
+Why there are three states is not known (assumption: three sampling patterns over the
+picture). The rule that picks the block for a read is not a simple function of time; the
+9 % of bursts that miss a state are probably reads that coincide with the TV's update.
+The old average of two reads 50 ms apart could not cancel this, and sampling every 25 ms
+(three frames) made it worse: slow beating between the states.
+
+### New sampling (default)
+
+One output frame is the mean of **three reads one panel frame (8.333 ms) apart**, every
+25 ms (`--interval 25 --phases 3 --frame-us 8333`, all in the args file for experiments;
+`--phases 1` is the old behaviour). The mean is about 8 ms old and held for 25 ms: about
+21 ms on average instead of 50. The UI plane is read every other frame (at most every
+40 ms). Measured on the TV: 39 frames/s, CPU by `--profile`:
+
+| setting | histogram read | UI plane | whole loop |
+| --- | --- | --- | --- |
+| 50 ms, 1 read (old) | 1.5 % | 3.3 % | 6.2 % |
+| 50 ms, 3 reads | 4.4 % | 3.2 % | 9.3 % |
+| 33 ms, 3 reads | 6.7 % | 4.7 % | 13.6 % |
+| 25 ms, 3 reads | 8.7 % | 6.4 % | 17.9 % |
+| **25 ms, 3 reads, UI every other frame** | | | **14.7 %** (top) |
+
+By eye, with HyperHDR's smoothing on: delay better, light calm, also on a dark picture.
+With HyperHDR's smoothing off the light flickers on nearly black pictures (the LEDs
+switch between off and their lowest step), so that smoothing stays on.
+
+### Found along the way
+
+- **Do not restart the service while protected video plays.** A restart during Disney+
+  left the histogram closed (`hist=lost-slow`) until the video was stopped: a new handle
+  is refused while protected content is on screen. Settings can be changed without a
+  restart (args file + SIGUSR1); a new binary is only swapped in while YouTube or the home
+  screen is in front.
+- The black-bar detector switches between 4 and 5 rows on 2.39:1 films (the bars are 4.6
+  rows of 36): 101 changes in one evening. Needs hysteresis or fractional bars.
+- A small bright logo on a black picture lit the bottom LEDs in the logo's colours (photo
+  from the user). Solved the same night, see the next section; the first guess at the cause
+  (the linear operator alone) was wrong.
+- Panel modes other than 120 Hz (50 Hz broadcasts may run the panel at 100 Hz) are not
+  measured; `--frame-us 10000` is the untested guess for that case.
+
+## Black must be black (2026-11-12)
+
+The user: on an OLED, LEDs that glow on a black picture spoil it. Three separate causes.
+
+### 1. HyperHDR's minimum backlight
+
+A fully black image sent to HyperHDR still gave a faint glow. `serverinfo` showed
+`backlightThreshold` 0.0039 (1/255, "Minimum backlight level" under Image Processing →
+Color Calibration; it applies to images, not to solid colours or effects). The user set it
+to 0: LEDs off on black, confirmed by eye and in `serverinfo`.
+
+### 2. A garbage row at the bottom of the TV's sampling grid
+
+Paused YouTube frame: a rainbow logo and two lines of text in the middle, everything else
+black. We sent 7 of 255 on average (max 14) to the bottom LEDs, nothing to the others.
+
+- The zone means themselves were the cause: top and side edge zones read exactly 0, but
+  bottom-left, bottom centre and bottom-right read 3.2 / 5.9 / 3.2, neutral grey.
+- `--hist-dump` (raw bins): a zone's bins add up to a small fixed number of samples that
+  factors as columns x rows of one grid: 7371 = 81x91 for the halves and the centre band,
+  1457 = 47x31 bottom-left, 1843 = 97x19 bottom centre, 1519 = 49x31 bottom-right,
+  2405 = 65x37 centre box. So the TV samples the picture on a **162x91 grid** (which also
+  explains the three measurement states: three sampling positions).
+- In that frame bottom-left had exactly 47 non-black samples, bottom centre 97 and
+  bottom-right 50: **one grid row each**, with scattered grey levels (5-243), the rest of
+  the zone at 0. The same count in all three measurement states.
+- The user sees nothing on the screen's lower edge, paused or playing. So the grid's last
+  row holds values that are not displayed. What they are is not known (assumption: decoder
+  padding below the visible picture). Only measured on YouTube.
+
+Fix: for the three zones that only cover the bottom (1, 5, 9) the brightest samples, one
+row's worth (97, 47, 49), are left out before the mean and the dark shares are computed.
+The sample totals are checked first, so another grid switches this off. On a black bottom
+edge the zones now read 0; on a bright one the mean hardly moves. The halves and the centre
+band also contain that row (81 of 7371 samples, under 1 level) and are left alone.
+
+### 3. The edge estimate itself
+
+The fixed operator has negative weights and only clamps at the end, so light can appear in
+cells whose zone reads black. Replaced, for 16:9 pictures, by a solve per frame:
+minimise |A x - h|^2 + lambda x'Lx with x >= 0 (A = measured footprints with entries under
+15 % of a zone's peak dropped, lambda = 0.001), by coordinate descent, 30 sweeps, starting
+from the old operator's answer. Cells of a zone that reads black (under 0.25 raw) are set
+to black and taken out of the smoothness term.
+
+| | old operator | new solve |
+| --- | --- | --- |
+| validation pictures, MAE at the LED rectangles (of 255) | 17.72 | 17.21 |
+| logo frame, garbage row left in: bottom LEDs mean / max | 6.8 / 14.2 | 6.5 / 16.6 |
+| logo frame, garbage row dropped: bottom LEDs max | 2.1 | 0.2 |
+| one solve per frame against the settled optimum, recorded video | – | mean 0.4, worst 3 |
+
+Row two is why the first diagnosis was wrong: with the garbage row in the data no estimate
+can keep the bottom dark. The Python model in `tools/calibrate.py` and the C code agree to
+0.04 of 255 (`tests/test_recon.c`). Over-relaxation made convergence worse.
+
+On the TV with both fixes: the LED stream for that frame is 0 on all 228 LEDs; the user
+sees the wall dark around the logo and normal pictures unchanged. CPU 14.7 % of one core
+(the solve costs 0.7-2 %).
+
+Limits:
+- Letterboxed pictures still use the fixed operators (`letterbox_b4.h`).
+- A 4:3 picture: the left bar has a zone of its own (columns 0-1) and stays black; the right
+  edge zone is three columns wide, so the right bar gets about 40 % of the picture's level
+  in the test. Detecting side bars from the dark shares would solve it.
+- Whether the garbage row exists on other sources is not measured; dropping it costs the
+  bottom zones their brightest 3-5 % of samples there.

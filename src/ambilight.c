@@ -67,12 +67,20 @@ struct input_event { struct timeval time; unsigned short type, code; int value; 
 static char g_host[64] = "192.168.129.249";
 static int g_port = 19444;
 static int g_priority = 150;
-static int g_interval_ms = 50;    // 20 Hz
+#define DEFAULT_INTERVAL_MS 25     // one output frame every 25 ms (40 Hz) = three panel frames at 120 Hz
+#define DEFAULT_PHASES 3           // histogram reads per output frame (--phases; 1 = one read, averaged with the previous frame's)
+#define DEFAULT_FRAME_US 8333      // spacing of those reads: one panel frame at 120 Hz
+#define UI_MIN_INTERVAL_MS 40      // the UI plane is read at most this often (it changes slowly; reading it costs CPU)
+static int g_interval_ms = DEFAULT_INTERVAL_MS;
+static int g_phases = DEFAULT_PHASES;
+static int g_frame_us = DEFAULT_FRAME_US;
 static int g_duration_ms = 1000;  // image expiry if the service stops feeding
 static double g_gain = 1.0;       // overall brightness gain before HyperHDR's own adjustment
 static int g_ui_cap_w = 320, g_ui_cap_h = 180;
 static int g_status_ms = 60000;    // status line interval (--status-ms)
 static bool g_ui_blend = true;     // --no-ui-blend: histogram reconstruction only (diagnostics)
+static bool g_linear;              // --linear: the fixed linear operator instead of the non-negative solve (comparison)
+static bool g_keep_last_row;       // --keep-last-row: do not drop the grid's last row from the bottom zones (comparison)
 
 // Re-acquire pacing after the histogram is lost (e.g. LG's captureservice grabbing it on
 // an app switch). For the first FAST window we retry every loop so we catch the brief
@@ -96,6 +104,25 @@ static uint64_t now_ms(void)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
+}
+
+static uint64_t now_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
+}
+
+// Sleep until an absolute time: the histogram reads have to be one panel frame apart.
+static void sleep_until_us(uint64_t t_us)
+{
+#ifdef __linux__
+    struct timespec ts = { (time_t)(t_us / 1000000ull), (long)(t_us % 1000000ull) * 1000L };
+    while (!g_stop && clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL) == EINTR) {}
+#else // native unit tests on other systems
+    uint64_t now = now_us();
+    if (t_us > now) usleep((useconds_t)(t_us - now));
+#endif
 }
 
 // --profile: CPU time of this thread per loop stage, logged every 10 s (developer tool).
@@ -501,15 +528,44 @@ static double mean_bin_f(const uint16_t* bins)
     return c ? (double)w / (double)c : 0.0;
 }
 
-// Read 16 zones into zrgb[16][3]; returns true on success.
-static bool hist_read(uint8_t zrgb[16][3])
+// The TV samples the picture on a 162x91 grid and each zone is a rectangle of it (its bin
+// counts add up to columns x rows: 47x31 bottom-left, 97x19 bottom centre, 49x31
+// bottom-right, 81x91 for the halves). On YouTube the last row of that grid holds grey
+// values that are not on the screen: under a picture with a black lower edge every bottom
+// zone had exactly one row of non-black samples (measured 2026-11-12 with --hist-dump),
+// which lit the bottom LEDs on dark pictures. For the three zones that only cover the
+// bottom, one row's worth of the brightest samples is left out. The totals are checked, so
+// a different grid (another model or firmware) switches this off.
+static const struct { int zone, total, cols; } LAST_ROW[] = { { 1, 1843, 97 }, { 5, 1457, 47 }, { 9, 1519, 49 } };
+
+static int last_row_cols(int zone, uint32_t total)
 {
-    hist_rec_t buf[16];
-    PF_BEGIN();
-    if (!g_hist || h_get(g_hist, buf) != 0) return false;
-    PF_MARK(PF_HIST_GET);
-    for (int i = 0; i < 16; i++)
+    for (size_t i = 0; i < sizeof(LAST_ROW) / sizeof(LAST_ROW[0]); i++)
+        if (LAST_ROW[i].zone == zone) return (uint32_t)LAST_ROW[i].total == total ? LAST_ROW[i].cols : 0;
+    return 0;
+}
+
+static void drop_brightest(uint16_t* bins, int n)
+{
+    for (int b = 255; b > 0 && n > 0; b--) {
+        int t = bins[b] < n ? bins[b] : n;
+        bins[b] = (uint16_t)(bins[b] - t);
+        n -= t;
+    }
+}
+
+// Zone means and dark shares from one set of histogram records (modifies the records).
+static void hist_process(hist_rec_t* buf, uint8_t zrgb[16][3])
+{
+    for (int i = 0; i < 16; i++) {
+        int drop = 0;
+        if (g_preset == 0 && !g_keep_last_row) {
+            uint32_t n = 0;
+            for (int b = 0; b < 256; b++) n += buf[i].bins[0][b];
+            drop = last_row_cols(i, n);
+        }
         for (int c = 0; c < 3; c++) {
+            if (drop) drop_brightest(buf[i].bins[c], drop);
             g_zf[i][c] = mean_bin_f(buf[i].bins[c]);
             zrgb[i][c] = mean_bin(buf[i].bins[c]);
             uint32_t total = 0, cum = 0;
@@ -520,8 +576,117 @@ static bool hist_read(uint8_t zrgb[16][3])
                 while (t < NLOW && b == LOW_T[t]) g_zlow[i][c][t++] = total ? (double)cum / total : 0;
             }
         }
+    }
+}
+
+// Read 16 zones into zrgb[16][3]; returns true on success.
+static bool hist_read(uint8_t zrgb[16][3])
+{
+    hist_rec_t buf[16];
+    PF_BEGIN();
+    if (!g_hist || h_get(g_hist, buf) != 0) return false;
+    PF_MARK(PF_HIST_GET);
+    hist_process(buf, zrgb);
     PF_MARK(PF_HIST_PROC);
     return true; // all-black is still a valid reading
+}
+
+// --hist-dump <file> (diagnostic, via the args file + reload): write the raw bins of one
+// read, one line per zone and channel ("zone channel count*256").
+static char g_dump_path[256];
+
+static void hist_dump(void)
+{
+    char path[sizeof(g_dump_path)];
+    snprintf(path, sizeof(path), "%s", g_dump_path);
+    g_dump_path[0] = 0; // once per request
+    hist_rec_t buf[16];
+    FILE* f = fopen(path, "w");
+    if (!f || !g_hist || h_get(g_hist, buf) != 0) {
+        if (f) fclose(f);
+        logmsg("hist-dump: not possible");
+        return;
+    }
+    for (int i = 0; i < 16; i++)
+        for (int c = 0; c < 3; c++) {
+            fprintf(f, "%d %d", i, c);
+            for (int b = 0; b < 256; b++) fprintf(f, " %u", buf[i].bins[c][b]);
+            fputc('\n', f);
+        }
+    fclose(f);
+    logmsg("hist-dump: written to %s", path);
+}
+
+// --hist-probe <file> (diagnostic, via the args file + reload): read the histogram in
+// bursts with different timings and record when each call returned, how long it took and
+// what it returned. Blocks the service for about 25 s (no frames, no keys); run it on a
+// still picture. This is how the three alternating measurement states were studied (see
+// docs/phase-0-1-findings.md).
+static char g_probe_path[256];
+
+static void hist_probe(void)
+{
+    // read offsets within a burst, in microseconds (-1 ends the list)
+    static const int burst[][5] = {
+        { 0, 8333, 16667, -1 },       // three reads one 120 Hz frame apart
+        { 0, 8000, 16000, -1 },       // the same, a little too fast
+        { 0, 8700, 17400, -1 },       // and a little too slow
+        { 0, 4167, 8333, 12500, -1 }, // four reads half a frame apart
+        { 0, 800, 8333, -1 },         // two reads back to back, one a frame later
+        { 0, 10000, 20000, -1 },      // three reads one 100 Hz frame apart
+        { 0, 8333, -1 },              // two reads one frame apart
+        { 0, -1 },                    // single reads
+    };
+    enum { NB = (int)(sizeof(burst) / sizeof(burst[0])), PER = 80, MAXREC = NB * PER * 4 };
+    static struct {
+        uint64_t t_us, hash;
+        uint32_t dur_us;
+        uint16_t type, group;
+        float m[48];
+    } rec[MAXREC];
+    char path[sizeof(g_probe_path)];
+    snprintf(path, sizeof(path), "%s", g_probe_path);
+    g_probe_path[0] = 0; // once per request
+    FILE* f = fopen(path, "w");
+    if (!f || !g_hist) {
+        if (f) fclose(f);
+        logmsg("hist-probe: not possible (%s)", g_hist ? "cannot write the file" : "no histogram");
+        return;
+    }
+    logmsg("hist-probe: %d burst types x %d to %s", NB, PER, path);
+    int n = 0;
+    bool ok = true;
+    uint64_t start = now_us() + 20000;
+    for (int ty = 0; ty < NB && ok && !g_stop; ty++)
+        for (int g = 0; g < PER && ok && !g_stop; g++) {
+            // bursts start 30 ms apart plus a step that sweeps the phase within a frame
+            start += 30000 + (uint64_t)((g * 1931) % 8333);
+            for (int k = 0; k < 5 && burst[ty][k] >= 0 && n < MAXREC; k++, n++) {
+                sleep_until_us(start + (uint64_t)burst[ty][k]);
+                hist_rec_t buf[16];
+                uint64_t t0 = now_us();
+                if (h_get(g_hist, buf) != 0) { ok = false; break; }
+                rec[n].t_us = now_us();
+                rec[n].dur_us = (uint32_t)(rec[n].t_us - t0);
+                rec[n].type = (uint16_t)ty;
+                rec[n].group = (uint16_t)g;
+                uint64_t h = 1469598103934665603ull; // FNV-1a over the bins: equal hash = same data
+                for (int i = 0; i < 16; i++)
+                    for (int c = 0; c < 3; c++) {
+                        for (int b = 0; b < 256; b++) h = (h ^ buf[i].bins[c][b]) * 1099511628211ull;
+                        rec[n].m[i * 3 + c] = (float)mean_bin_f(buf[i].bins[c]);
+                    }
+                rec[n].hash = h;
+            }
+        }
+    for (int i = 0; i < n; i++) {
+        fprintf(f, "%u %u %llu %u %016llx", rec[i].type, rec[i].group, (unsigned long long)rec[i].t_us, rec[i].dur_us,
+            (unsigned long long)rec[i].hash);
+        for (int c = 0; c < 48; c++) fprintf(f, " %.3f", rec[i].m[c]);
+        fputc('\n', f);
+    }
+    fclose(f);
+    logmsg("hist-probe: %d reads written%s", n, ok ? "" : " (a read failed)");
 }
 
 // ---------------------------------------------------------------- UI plane (halgal)
@@ -789,6 +954,106 @@ static double level_map(double raw, int c)
 // raw domain (PROFILE_R, see tools/calibrate.py); the level map is applied afterwards.
 // With black bars (level lb > 0) the bars' known black contribution is removed from each
 // zone first and the bar-aware operator LB_R reconstructs the picture (tools/letterbox.py).
+// Non-negative reconstruction (16:9 pictures). The 16 zone means are explained by 144 cell
+// colours through the measured footprints PROFILE_A: minimise |A x - h|^2 + lambda x'Lx
+// (L = grid Laplacian) with every cell x >= 0, by coordinate descent. Each frame starts
+// from the fixed linear operator's answer (PROFILE_R, negative parts cut off), which is
+// already close, so the result depends on the current frame only. Unlike that operator
+// (which has negative weights and only clamps afterwards) a zone that reads black forces
+// all of its cells to black, so a bright object in the middle of a black picture no longer
+// leaks to the edges. Cells of a black zone are set to black outright and taken out of the
+// smoothness term: otherwise a bright neighbour would pull a few percent of its light into
+// them, and the black cells would darken the neighbour.
+#define NN_CELLS (PROFILE_ROWS * PROFILE_COLS)
+// 30 sweeps from the linear start stay within 3 of 255 of the settled optimum on recorded
+// video (mean 0.4); 60 would halve the CPU saved for 0.6. Over-relaxation made it worse.
+#ifndef NN_MAX_SWEEPS
+#define NN_MAX_SWEEPS 30
+#endif
+#define NN_TOL 0.01 // stop when no cell moved more than this (raw levels) in a sweep
+#define NN_BLACK 0.25 // a zone mean below this (raw levels above black) is a black zone
+static struct {
+    int nz;         // zones that cover this cell
+    int z[16];
+    double w[16];
+    int nnb;        // neighbours in the grid
+    int nb[4];
+    double wsq;     // sum of the squared weights
+} g_nn[NN_CELLS];
+static bool g_nn_ready;
+static double g_nn_x[3][NN_CELLS]; // solution per channel (raw levels above black)
+
+static void nnls_init(void)
+{
+    for (int k = 0; k < NN_CELLS; k++) {
+        int y = k / PROFILE_COLS, x = k % PROFILE_COLS;
+        double d = 0;
+        g_nn[k].nz = 0;
+        for (int z = 0; z < 16; z++)
+            if (PROFILE_A[z][k] != 0) {
+                g_nn[k].z[g_nn[k].nz] = z;
+                g_nn[k].w[g_nn[k].nz++] = PROFILE_A[z][k];
+                d += (double)PROFILE_A[z][k] * PROFILE_A[z][k];
+            }
+        g_nn[k].nnb = 0;
+        if (x > 0) g_nn[k].nb[g_nn[k].nnb++] = k - 1;
+        if (x < PROFILE_COLS - 1) g_nn[k].nb[g_nn[k].nnb++] = k + 1;
+        if (y > 0) g_nn[k].nb[g_nn[k].nnb++] = k - PROFILE_COLS;
+        if (y < PROFILE_ROWS - 1) g_nn[k].nb[g_nn[k].nnb++] = k + PROFILE_COLS;
+        g_nn[k].wsq = d;
+    }
+    g_nn_ready = true;
+}
+
+// h: zone means with black removed (>= 0). x: start value in, solution out. Returns the sweeps used.
+static int nnls_solve(const double h[16], double x[NN_CELLS])
+{
+    if (!g_nn_ready) nnls_init();
+    double r[16];
+    bool black[NN_CELLS];
+    int nfree = 0;
+    for (int k = 0; k < NN_CELLS; k++) {
+        black[k] = g_nn[k].nz == 0; // a cell no zone covers cannot be estimated
+        for (int i = 0; i < g_nn[k].nz; i++)
+            if (h[g_nn[k].z[i]] < NN_BLACK) black[k] = true;
+        if (black[k]) x[k] = 0;
+        else nfree++;
+    }
+    if (!nfree) return 0; // a black picture is black at once
+    for (int z = 0; z < 16; z++) r[z] = h[z];
+    for (int k = 0; k < NN_CELLS; k++)
+        if (x[k] != 0)
+            for (int i = 0; i < g_nn[k].nz; i++) r[g_nn[k].z[i]] -= g_nn[k].w[i] * x[k];
+    int sweep = 0;
+    while (sweep < NN_MAX_SWEEPS) {
+        double moved = 0;
+        for (int k = 0; k < NN_CELLS; k++) {
+            if (black[k]) continue;
+            double g = 0, nbsum = 0;
+            int deg = 0;
+            for (int i = 0; i < g_nn[k].nz; i++) g += g_nn[k].w[i] * r[g_nn[k].z[i]];
+            for (int i = 0; i < g_nn[k].nnb; i++)
+                if (!black[g_nn[k].nb[i]]) {
+                    nbsum += x[g_nn[k].nb[i]];
+                    deg++;
+                }
+            g -= PROFILE_NNLS_LAMBDA * (deg * x[k] - nbsum);
+            double nx = x[k] + g / (g_nn[k].wsq + PROFILE_NNLS_LAMBDA * deg);
+            if (nx < 0) nx = 0;
+            double d = nx - x[k];
+            if (d != 0) {
+                x[k] = nx;
+                for (int i = 0; i < g_nn[k].nz; i++) r[g_nn[k].z[i]] -= g_nn[k].w[i] * d;
+                if (d < 0) d = -d;
+                if (d > moved) moved = d;
+            }
+        }
+        sweep++;
+        if (moved < NN_TOL) break;
+    }
+    return sweep;
+}
+
 static void reconstruct(const double zm[16][3], int lb, double out[GRID_H][GRID_W][3])
 {
     static double cell[PROFILE_ROWS][PROFILE_COLS][3];
@@ -796,6 +1061,23 @@ static void reconstruct(const double zm[16][3], int lb, double out[GRID_H][GRID_
     double m[16][3];
     for (int z = 0; z < 16; z++)
         for (int c = 0; c < 3; c++) m[z][c] = zm[z][c];
+    bool nn = lb == 0 && !g_linear;
+    if (nn)
+        for (int c = 0; c < 3; c++) {
+            double h[16];
+            for (int z = 0; z < 16; z++) {
+                double v = m[z][PROFILE_PERM[c]] - PROFILE_BLACK[c];
+                h[z] = v > 0 ? v : 0;
+            }
+            for (int k = 0; k < NN_CELLS; k++) {
+                double v = 0;
+                for (int z = 0; z < 16; z++) v += PROFILE_R[k][z] * h[z];
+                g_nn_x[c][k] = v > 0 ? v : 0;
+            }
+            nnls_solve(h, g_nn_x[c]);
+            for (int k = 0; k < NN_CELLS; k++)
+                cell[k / PROFILE_COLS][k % PROFILE_COLS][c] = level_map(g_nn_x[c][k] + PROFILE_BLACK[c], c);
+        }
 #if HAVE_LB
     if (lb > 0) {
         R = LB_R[lb - 1];
@@ -805,7 +1087,7 @@ static void reconstruct(const double zm[16][3], int lb, double out[GRID_H][GRID_
 #else
     (void)lb;
 #endif
-    for (int k = 0; k < PROFILE_ROWS * PROFILE_COLS; k++)
+    for (int k = 0; !nn && k < PROFILE_ROWS * PROFILE_COLS; k++)
         for (int c = 0; c < 3; c++) {
             double raw = 0;
             for (int z = 0; z < 16; z++) raw += R[k][z] * m[z][PROFILE_PERM[c]];
@@ -910,6 +1192,12 @@ static void reset_user_settings(void)
     g_ui_blend = true;
     g_lb_enabled = true;
     g_toggle_key = g_dim_key = g_bright_key = 0;
+    g_interval_ms = DEFAULT_INTERVAL_MS;
+    g_phases = DEFAULT_PHASES;
+    g_frame_us = DEFAULT_FRAME_US;
+    g_linear = false;
+    g_keep_last_row = false;
+    g_profile = false;
 }
 
 static void apply_args(int argc, char** argv)
@@ -919,10 +1207,16 @@ static void apply_args(int argc, char** argv)
         else if (!strcmp(argv[i], "--port") && i + 1 < argc) g_port = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--priority") && i + 1 < argc) g_priority = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--interval") && i + 1 < argc) g_interval_ms = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--phases") && i + 1 < argc) g_phases = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--frame-us") && i + 1 < argc) g_frame_us = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--gain") && i + 1 < argc) g_gain = atof(argv[++i]);
         else if (!strcmp(argv[i], "--no-ui-blend")) g_ui_blend = false;
+        else if (!strcmp(argv[i], "--linear")) g_linear = true;
+        else if (!strcmp(argv[i], "--keep-last-row")) g_keep_last_row = true;
         else if (!strcmp(argv[i], "--no-letterbox")) g_lb_enabled = false;
         else if (!strcmp(argv[i], "--profile")) g_profile = true;
+        else if (!strcmp(argv[i], "--hist-probe") && i + 1 < argc) snprintf(g_probe_path, sizeof(g_probe_path), "%s", argv[++i]);
+        else if (!strcmp(argv[i], "--hist-dump") && i + 1 < argc) snprintf(g_dump_path, sizeof(g_dump_path), "%s", argv[++i]);
         else if (!strcmp(argv[i], "--toggle-key") && i + 1 < argc) g_toggle_key = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--dim-key") && i + 1 < argc) g_dim_key = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--bright-key") && i + 1 < argc) g_bright_key = atoi(argv[++i]);
@@ -1257,11 +1551,12 @@ int main(int argc, char** argv)
     uint64_t t_self = now_ms();
     uint64_t t_maintain = now_ms() + 3 * 60 * 1000; // first upkeep 3 min after start, then every 6 h
 
-    logmsg("ambilight %s starting: host %s:%d priority %d interval %dms%s", AMBI_VERSION, g_host, g_port, g_priority,
-        g_interval_ms, g_paused ? " (paused)" : "");
+    logmsg("ambilight %s starting: host %s:%d priority %d sampling %d ms x%d%s", AMBI_VERSION, g_host, g_port,
+        g_priority, g_interval_ms, g_phases, g_paused ? " (paused)" : "");
 
     while (!g_stop) {
-        uint64_t t = now_ms();
+        uint64_t t_us = now_us();
+        uint64_t t = t_us / 1000; // same clock as now_ms()
 
         if (t - t_self >= 5000) {
             t_self = t;
@@ -1310,9 +1605,10 @@ int main(int argc, char** argv)
                 g_in_rescan = true;
                 if (!keys_wanted()) input_close_all();
             }
-            logmsg("settings reloaded: host %s:%d priority %d gain %.2f letterbox %s ui-blend %s keys %d/%d/%d%s", g_host,
-                g_port, g_priority, g_gain, g_lb_enabled ? "on" : "off", g_ui_blend ? "on" : "off", g_toggle_key,
-                g_dim_key, g_bright_key, g_paused ? " (paused)" : "");
+            logmsg("settings reloaded: host %s:%d priority %d gain %.2f letterbox %s ui-blend %s keys %d/%d/%d "
+                   "sampling %d ms x%d%s", g_host, g_port, g_priority, g_gain, g_lb_enabled ? "on" : "off",
+                g_ui_blend ? "on" : "off", g_toggle_key, g_dim_key, g_bright_key, g_interval_ms, g_phases,
+                g_paused ? " (paused)" : "");
         }
 
         if (!g_hist && t >= next_open_try) {
@@ -1332,14 +1628,39 @@ int main(int argc, char** argv)
             }
         }
 
+        if (g_probe_path[0]) hist_probe();
+        if (g_dump_path[0]) hist_dump();
+
+        // One output frame is the mean of `--phases` reads taken one panel frame apart.
+        // The TV's histogram cycles through three slightly different measurements of the
+        // same picture (up to 10 % apart in dark zones); three reads a frame apart return
+        // all three in 9 of 10 bursts, which removes that ripple (measured with
+        // --hist-probe: mean error 0.05 levels against 0.44 for two reads, 0.84 for one).
         uint8_t z[16][3];
-        bool got = g_hist && hist_read(z);
-        if (got) {
-            // Average with the previous read: consecutive reads alternate between two
-            // buffers on moving video; averaging halves the resulting jitter (measured).
+        int nph = g_paused ? 1 : (g_phases < 1 ? 1 : (g_phases > 6 ? 6 : g_phases));
+        bool got = g_hist != NULL;
+        static double zacc[16][3], lowacc[16][3][NLOW];
+        for (int k = 0; k < nph && got; k++) {
+            if (k) sleep_until_us(t_us + (uint64_t)k * (uint64_t)g_frame_us);
+            got = hist_read(z);
+            for (int i = 0; got && i < 16; i++)
+                for (int c = 0; c < 3; c++) {
+                    zacc[i][c] = (k ? zacc[i][c] : 0) + g_zf[i][c];
+                    for (int q = 0; q < NLOW; q++) lowacc[i][c][q] = (k ? lowacc[i][c][q] : 0) + g_zlow[i][c][q];
+                }
+        }
+        if (got && nph > 1)
             for (int i = 0; i < 16; i++)
                 for (int c = 0; c < 3; c++) {
-                    zhold[i][c] = prev_ok ? (g_zf[i][c] + zprev[i][c]) / 2 : g_zf[i][c];
+                    g_zf[i][c] = zacc[i][c] / nph;
+                    for (int q = 0; q < NLOW; q++) g_zlow[i][c][q] = lowacc[i][c][q] / nph;
+                }
+        if (got) {
+            // A single read per frame: average it with the previous frame's read instead,
+            // which halves the ripple at the cost of half an interval of delay.
+            for (int i = 0; i < 16; i++)
+                for (int c = 0; c < 3; c++) {
+                    zhold[i][c] = (nph == 1 && prev_ok) ? (g_zf[i][c] + zprev[i][c]) / 2 : g_zf[i][c];
                     zprev[i][c] = g_zf[i][c];
                 }
             prev_ok = true;
@@ -1362,14 +1683,19 @@ int main(int argc, char** argv)
         if (have_colour && !g_paused) {
             static uint8_t urgb[GRID_H][GRID_W][3];
             static uint8_t ua[GRID_H][GRID_W];
-            bool have_ui = g_ui_ok && ui_read(urgb, ua);
-            if (have_ui) {
-                uint32_t sa = 0;
-                for (int r = 0; r < GRID_H; r++)
-                    for (int c = 0; c < GRID_W; c++) sa += ua[r][c];
-                g_ui_cover = sa / (255.0 * GRID_W * GRID_H);
-            } else {
-                g_ui_cover = 0;
+            static bool have_ui;
+            static uint64_t ui_read_at;
+            if (!ui_read_at || t - ui_read_at >= UI_MIN_INTERVAL_MS - 2) { // else: reuse the last UI frame
+                ui_read_at = t;
+                have_ui = g_ui_ok && ui_read(urgb, ua);
+                if (have_ui) {
+                    uint32_t sa = 0;
+                    for (int r = 0; r < GRID_H; r++)
+                        for (int c = 0; c < GRID_W; c++) sa += ua[r][c];
+                    g_ui_cover = sa / (255.0 * GRID_W * GRID_H);
+                } else {
+                    g_ui_cover = 0;
+                }
             }
             if (g_calib && have_ui) {
                 calib_dump_ui(t);
@@ -1424,11 +1750,14 @@ int main(int argc, char** argv)
         // while waiting, so it takes effect at once.
         bool fast_phase = down_since && (t - down_since) < FAST_REACQUIRE_MS;
         int budget = g_hist ? (g_paused ? 500 : g_interval_ms) : (fast_phase ? 10 : 50);
-        if (wait_until(t + (uint64_t)budget)) {
+        uint64_t next_us = t_us + (uint64_t)budget * 1000;
+        if (wait_until(next_us / 1000)) {
             if (g_key_toggle) set_paused(!g_paused, true, true);
             if (g_key_steps) gain_step(g_key_steps, now_ms());
             g_key_toggle = false;
             g_key_steps = 0;
+        } else {
+            sleep_until_us(next_us); // the part of a millisecond left: keeps the read cadence exact
         }
     }
 
