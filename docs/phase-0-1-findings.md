@@ -807,3 +807,97 @@ Limits:
   in the test. Detecting side bars from the dark shares would solve it.
 - Whether the garbage row exists on other sources is not measured; dropping it costs the
   bottom zones their brightest 3-5 % of samples there.
+
+## Reading more than one histogram preset (2026-11-12): possible, but little real gain
+
+Idea: presets 1 (letterbox crop) and 2 (pillarbox crop) place the same zones on a smaller
+area, so stacking their equations with preset 0's in the non-negative solve should resolve
+the edges better. Simulated through the footprints on the 15 validation pictures the error
+at the LEDs fell from 16.8 to 7.9; on the letterbox set, with real reads of presets 0 and
+1, from 34.6 to 18.6. Measured on the TV with the new `--preset-probe` and `--preset-rec`:
+
+- **Switching is immediate.** `vtCapture_setPresetHistogram` takes 0.14-0.37 ms and the
+  very next read (under 1 ms later) already has the new preset's zones; rotating presets
+  0, 1, 2 with one read a frame later was right 90 times out of 90.
+- Sample totals per zone, hence exact rectangles (columns x rows of the 162x91 grid):
+  preset 1 keeps the columns and squeezes the rows into 68 of 91 (rows 11-78), preset 2
+  keeps the rows and squeezes the columns into 121 of 162 (columns 20-140); zones 14 and
+  15 are the same in every preset. Preset 3 has 14 zones of other sizes.
+- **About 1 % of the reads taken right after a switch are wrong** (10 of 1080): all zones
+  far off, in two recurring patterns, partly 100 ms apart. Not seen without switching
+  (0 of 1760 and 0 of 817 earlier). Cause not known.
+- **Real gain on a real screen is small.** Home screen (all UI, so the UI capture is the
+  ground truth; 3 s, presets 0-2 in every panel frame). After removing a level factor (see
+  below), error at the 221 LEDs: preset 0 alone 18.3; with preset 2 15.2-16.7; with preset 1
+  17.8-23.6; all three 16.7-23.5, depending on the model (measured footprints or exact
+  rectangles, 16x9 or 32x18 cells). One flat colour for all LEDs gives 23.4.
+- Why the simulation was too rosy: the validation pictures are coarse blocks, where extra
+  equations are worth most; and each zone mean deviates 4-6 % from what the true picture
+  predicts (sparse sampling of fine detail), which the differences between presets amplify.
+
+Conclusion: not built. Whether smooth film pictures would gain more is not measured (no
+ground truth for video).
+
+Also seen:
+- On the home screen every zone, channel and preset reads **0.79 times** the level the
+  calibration predicts from the UI picture (0.75-0.86 per zone). The calibration page
+  gave 1.0 by construction. So the histogram's level depends on the context (picture mode
+  or the home screen's own dimming - not determined). Irrelevant for menus, whose colours
+  come from the UI plane; for video it may put the LEDs off by a factor in other modes.
+- With three reads in every panel frame each preset returns the same sampling state every
+  time: the three-state rotation needs reads a frame apart.
+- libvtcapture exports nothing but init / set preset (0-3) / get / finalize for the
+  histogram: no way to place zones freely through the library.
+
+## Black bars from the sample grid (2026-11-12)
+
+Replaces the level detector and the per-level operators of the section "Black bars (21:9)".
+
+**Measuring.** Every zone is a rectangle of the 162x91 sample grid (`PROFILE_ZONE`, fitted
+by `tools/calibrate.py` from the sample totals and the measured footprints; a rectangle
+within two samples of a screen edge is taken to touch it). For a zone that touches an edge,
+black share x zone size is the number of black sample rows (columns) at that edge; the
+smallest value among those zones is the bar, zones that are black all over are left out.
+For the three bottom zones the grid's last row is not in the statistics but is part of the
+bar (+1). The two bars of a pair are equal: the larger value when they agree within 1.5
+samples, otherwise the smaller + 1.5.
+
+- Letterbox capture (UI pictures with known bars): 13.00 measured for 12.64, 10.00 for
+  10.11, 8.00 for 7.58, 5.00 for 5.06 samples; 0 for the 16:9 pictures, also the one with a
+  dark band at the top only. In that capture (taken before the garbage row was removed) the
+  bottom zones read one dark row less than the top ones: the garbage row is there for UI
+  pictures too, not only on YouTube.
+- **The black threshold matters.** With "16 or lower" (the old detector's) a 2.39:1 film on
+  Disney+ gave 12.0-15.5 rows at the top, 11.5-16.5 at the bottom and side bars of up to 9
+  columns in dark scenes: 10 changes in 16 s when replayed through the tracker. With "4 or
+  lower" the same recording gives 12.00 at the top in every one of 576 frames, 10.9-11.7 at
+  the bottom (hence the pair rule) and no side bars: one change, the adoption. A zone that
+  lies inside the bar has every sample at 4 or lower.
+
+**Following.** A larger bar is adopted after 2 s without interruption (the smallest value
+seen), a bar that grows by less than 3 samples only after 15 s, a smaller one after 0.1 s.
+Undecided (nothing changes) while the centre zone is mostly black or a side has no zone that
+is not black all over; an opaque UI over half the screen means no bars at once. Limits: 19
+rows (20.9 %) top and bottom, 22 columns (13.6 %) left and right.
+
+**Solving.** The 16x9 cells are laid over the picture area and the footprints are the exact
+overlaps (`area_setup`: also the least-squares start operator, by Cholesky, 2-3 ms on the
+TV, only when the bars change). The image is the picture itself, so no crop afterwards; the
+UI layer is sampled where it lies over the picture. A cell is blacked out by a black zone
+that covers at least half of it.
+
+| | per-level operators | solve over the picture area |
+| --- | --- | --- |
+| 8 letterboxed pictures, error against the cropped picture (old LED layout) | 22.29 | 20.24 |
+| 15 validation pictures (16:9) | 17.21 (measured footprints) | 17.15 (rectangles) |
+
+The C code equals the Python model to 0.05 of 255, full frame and with bars
+(`tests/test_recon.c`, which also plays films, dark scenes, cuts, a menu and a logo on black
+through the tracker).
+
+On the TV (a film with bars, about 90 s): bars adopted at 13.2 % top and bottom; by eye top
+and bottom follow the picture's edge without jumps and dark scenes stay dark. The log showed
+two small swings (13.2 <-> 14.8 %) in the first seconds, from a dark scene next to the bars;
+the 15 s rule for small growth was added after that and is only tested offline. CPU 14 %.
+
+Not measured: 4:3 content on the TV (only in the unit test), bars that are not black.

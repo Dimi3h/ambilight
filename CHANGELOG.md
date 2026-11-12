@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.2.4
+
+- Black bars, redone. The bar height is measured from the TV's sample grid (black share of
+  the zones at each edge x their size) instead of picked from seven levels: exact to about
+  half a percent of the picture, the same in every frame of a film (it used to jump between
+  three levels in dark scenes; one film logged 101 changes in an evening). Bars grow only
+  after 2 s (a slightly larger bar after 15 s) and shrink within 0.2 s when light appears.
+- Letterboxed films get the same non-negative solve as other pictures, laid over the picture
+  between the bars: black stays black there too, and the error on the recorded letterbox
+  pictures drops from 22.3 to 20.2 of 255.
+- Side bars (4:3 pictures) are handled the same way: both side strips now show the picture's
+  edge instead of the right one getting stray light.
+- The settings app shows the bars in percent. The package is half the size (the tables per
+  bar height are gone).
+- New diagnostics `--preset-probe` and `--preset-rec` (see the findings: reading several
+  histogram presets was measured and not adopted).
+
 ## 0.2.3
 
 - Less delay and less flicker: every output frame is now the mean of three colour readings

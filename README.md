@@ -14,7 +14,9 @@ Personal-use homebrew.
   footprints (`src/profile_b4.h`): a per-frame solve in which no cell may go below black, so
   a zone that reads black stays black. Removes the picture mode's white-balance tint.
 - Blends the **UI plane** (menus, subtitles, launchers) on top, per pixel.
-- Detects **black bars** (21:9 films) and stretches the picture to the full LED frame.
+- Measures **black bars** (letterboxed films, 4:3 pictures) to about half a percent of the
+  picture and solves over the picture between them, so the LEDs show the picture's edges;
+  dark scenes do not make the bars jump, and a logo on black is not mistaken for bars.
 - Sends one small PNG per frame to HyperHDR's JSON API (port 19444): **one origin,
   one priority** (150 by default). HyperHDR's LED layout and smoothing do the rest.
 - 40 frames a second, each the mean of three readings (the TV's measurement cycles through
@@ -201,8 +203,9 @@ rm -rf /media/developer/ambilight
 
 - 16 zones are coarser than a per-pixel frame grabber; validation error at the LED
   rectangles is ~17/255 on mixed test images (see the findings).
-- A 4:3 picture: the left bar stays black (it has a zone of its own), the right bar gets
-  some of the picture's light, because the right edge zone is three columns wide.
+- Bars are recognised up to 21 % of the height (top and bottom) and 13.6 % of the width
+  (left and right, enough for 4:3); wider side bars, as around upright phone video, are left
+  as black picture. Bars have to be black (level 4 of 255 or lower).
 - The grid's garbage row (see the findings) is dropped from the three bottom zones on every
   source; where that row is real picture, the bottom LEDs lose their brightest 3-5 % of
   samples (subtitles among them).
@@ -223,8 +226,9 @@ rm -rf /media/developer/ambilight
   the service yet. See the findings.
 - The white point in the profile was measured in the picture mode "cinema"; other modes,
   HDR and Dolby Vision are not calibrated and may tint the LEDs.
-- Calibration (`src/profile_b4.h`, `src/letterbox_b4.h`) is for the B4 on this firmware;
-  `tools/calibrate.py` and `tools/letterbox.py` regenerate it (procedure in the findings).
+- Calibration (`src/profile_b4.h`: levels and the zones' rectangles on the TV's sample grid)
+  is for the B4 on this firmware; `tools/calibrate.py` regenerates it and `tools/letterbox.py`
+  checks the bar handling against a capture (procedure in the findings).
 
 ## Development tools
 

@@ -16,10 +16,9 @@ Steps:
   4. derive each zone's footprint A[z][k] over the 16x9 cells;
   5. build reconstruction operators R (cells x zones) and evaluate them on the
      validation images exactly as HyperHDR will see them (mean over each LED rectangle);
-  6. evaluate the non-negative solve the service uses for 16:9 pictures (same model, cells
-     >= 0, solved per frame) on the same images;
-  7. write the best operator, the footprints for the non-negative solve and the level map
-     to a C header.
+  6. fit each zone's rectangle on the TV's sample grid and evaluate the non-negative solve
+     the service uses (cells >= 0, solved per frame over the picture area) on the same images;
+  7. write the level map and the zone rectangles to a C header.
 Pure Python (no numpy); the linear systems are small.
 """
 import bisect
@@ -35,50 +34,114 @@ UW, UH = 32, 18          # UI ground-truth grid
 GW, GH = 16, 9           # calibration / reconstruction grid
 NZ = 16
 NNLS_LAMBDA = 0.001      # smoothness weight of the non-negative solve
-NNLS_CLEAN = 0.15        # footprint entries below this share of a zone's strongest cell are dropped
 NNLS_BLACK = 0.25        # a zone mean below this (raw levels above black) is a black zone
+NNLS_PIN = 0.5           # ... and blacks out the cells it covers at least this far
+NNLS_SWEEPS = 30         # coordinate-descent sweeps per frame in the service
+
+# The TV samples the picture on a grid of SGW x SGH points; every zone is a rectangle of it.
+# ZONE_SAMPLES are the bin totals per zone of preset 0 (columns x rows), read with the
+# service's --hist-dump on the B4. With the measured footprints they fix each rectangle.
+SGW, SGH = 162, 91
+ZONE_SAMPLES = [7371, 1843, 2405, 931, 7371, 1457, 1584, 1666, 7371, 1519, 1584, 931, 931, 1666, 780, 777]
 
 
-def clean_footprints(An):
-    """Footprints for the non-negative solve: weak entries are measurement residue (a zone
-    answering 0.1-0.5 % to cells far outside its rectangle); with them a dark zone could no
-    longer force its cells to black. Rows are renormalised to 1."""
-    out = []
-    for row in An:
-        mx = max(row)
-        kept = [v if v >= NNLS_CLEAN * mx else 0.0 for v in row]
-        t = sum(kept)
-        out.append([v / t for v in kept])
-    return out
+def overlap(a0, a1, b0, b1):
+    return max(0.0, min(a1, b1) - max(a0, b0))
 
 
-def nnls_cells(Ac, h, lam, sweeps=150):
-    """min ||Ac x - h||^2 + lam * x'Lx, x >= 0, by coordinate descent (what src/ambilight.c does).
-    Cells of a zone that reads black (h < NNLS_BLACK) are black and left out of the smoothness term."""
-    n = GW * GH
+def fit_zone_rects(An):
+    """Per zone (first column, columns, first row, rows) on the sample grid: the factorisation
+    of the zone's sample total and the position that best match the measured footprint's
+    column and row profiles. A rectangle that ends within two samples of a screen edge is
+    taken to touch it (assumption; the footprints are too coarse to tell)."""
+    rects = []
+    for z in range(NZ):
+        colp = [sum(An[z][y * GW + x] for y in range(GH)) for x in range(GW)]
+        rowp = [sum(An[z][y * GW + x] for x in range(GW)) for y in range(GH)]
+        best = None
+        for nc in range(8, SGW + 1):
+            if ZONE_SAMPLES[z] % nc:
+                continue
+            nr = ZONE_SAMPLES[z] // nc
+            if nr > SGH or nr < 8:
+                continue
+            ec, c0 = min((sum((overlap(c, c + nc, x * SGW / GW, (x + 1) * SGW / GW) / nc - colp[x]) ** 2
+                              for x in range(GW)), c) for c in range(SGW - nc + 1))
+            er, r0 = min((sum((overlap(r, r + nr, y * SGH / GH, (y + 1) * SGH / GH) / nr - rowp[y]) ** 2
+                              for y in range(GH)), r) for r in range(SGH - nr + 1))
+            if best is None or ec + er < best[0]:
+                best = (ec + er, c0, nc, r0, nr)
+        _, c0, nc, r0, nr = best
+        if c0 <= 2: c0 = 0
+        if SGW - (c0 + nc) <= 2: c0 = SGW - nc
+        if r0 <= 2: r0 = 0
+        if SGH - (r0 + nr) <= 2: r0 = SGH - nr
+        rects.append((c0, nc, r0, nr))
+    return rects
+
+
+def area_model(rects, bars, gw=GW, gh=GH):
+    """Footprints of the zones over a gw x gh grid laid on the picture area. bars = (left,
+    right, top, bottom) in samples. Returns A[z][k], the share of zone z's samples that fall
+    in cell k, and cover[z][k], the share of cell k that zone z covers."""
+    l, r, t, b = bars
+    x0, y0 = l, t
+    cw, ch = (SGW - l - r) / gw, (SGH - t - b) / gh
+    A, cover = [], []
+    for c0, nc, r0, nr in rects:
+        ra, rc = [], []
+        for j in range(gh):
+            oy = overlap(r0, r0 + nr, y0 + j * ch, y0 + (j + 1) * ch)
+            for i in range(gw):
+                o = oy * overlap(c0, c0 + nc, x0 + i * cw, x0 + (i + 1) * cw)
+                ra.append(o / (nc * nr)); rc.append(o / (cw * ch))
+        A.append(ra); cover.append(rc)
+    return A, cover
+
+
+def ls_operator(A, gw=GW, gh=GH, lam=NNLS_LAMBDA):
+    """R[k][z]: unconstrained least-squares answer (A'A + lam L) x = A'h, the solve's start value."""
+    n = gw * gh
+    L = laplacian(gw, gh)
+    AtA = [[sum(A[z][i] * A[z][j] for z in range(len(A))) + lam * L[i][j] for j in range(n)] for i in range(n)]
+    return solve(AtA, [[A[z][i] for z in range(len(A))] for i in range(n)])
+
+
+def nnls_area(A, cover, R, h, gw=GW, gh=GH, lam=NNLS_LAMBDA, sweeps=NNLS_SWEEPS):
+    """What src/ambilight.c does per frame and channel: start from the linear answer with the
+    negative parts cut off, then coordinate descent on |A x - h|^2 + lam x'Lx with x >= 0.
+    Cells that a black zone covers for the most part are black and leave the smoothness term."""
+    n = gw * gh
     nb = [[] for _ in range(n)]
-    for y in range(GH):
-        for x in range(GW):
+    for y in range(gh):
+        for x in range(gw):
             for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-                if 0 <= x + dx < GW and 0 <= y + dy < GH:
-                    nb[y * GW + x].append((y + dy) * GW + x + dx)
-    cols = [[(z, Ac[z][k]) for z in range(NZ) if Ac[z][k]] for k in range(n)]
-    black = [not cols[k] or any(h[z] < NNLS_BLACK for z, _ in cols[k]) for k in range(n)]
+                if 0 <= x + dx < gw and 0 <= y + dy < gh:
+                    nb[y * gw + x].append((y + dy) * gw + x + dx)
+    cols = [[(z, A[z][k]) for z in range(len(A)) if A[z][k]] for k in range(n)]
+    black = [any(h[z] < NNLS_BLACK and cover[z][k] >= NNLS_PIN for z in range(len(A))) for k in range(n)]
     free = [[j for j in nb[k] if not black[j]] for k in range(n)]
-    diag = [sum(w * w for _, w in cols[k]) + lam * len(free[k]) for k in range(n)]
-    x = [0.0] * n
+    x = [0.0 if black[k] else max(0.0, sum(R[k][z] * h[z] for z in range(len(A)))) for k in range(n)]
     r = list(h)
+    for k in range(n):
+        if x[k]:
+            for z, w in cols[k]:
+                r[z] -= w * x[k]
     for _ in range(sweeps):
+        moved = 0.0
         for k in range(n):
             if black[k]:
                 continue
             g = sum(w * r[z] for z, w in cols[k]) - lam * (len(free[k]) * x[k] - sum(x[j] for j in free[k]))
-            nx = max(0.0, x[k] + g / diag[k])
+            nx = max(0.0, x[k] + g / (sum(w * w for _, w in cols[k]) + lam * len(free[k])))
             d = nx - x[k]
             if d:
                 x[k] = nx
                 for z, w in cols[k]:
                     r[z] -= w * d
+                moved = max(moved, abs(d))
+        if moved < 0.01:
+            break
     return x
 
 
@@ -374,15 +437,21 @@ def main():
         for up in (False, True):
             e = evaluate(R, up); results.append((e, f"least-squares lam={lam:g}", up, R))
             print(f"  least-squares lam={lam:<9g}        up={int(up)}  MAE {e:6.2f}")
-    # The non-negative solve (used by the service for 16:9 pictures): same model, but no cell
-    # may go below black, so a zone that reads black keeps its cells dark.
-    Ac = clean_footprints(An)
-    def nnls_eval(lam):
+    # The non-negative solve of the service: exact zone rectangles, no cell below black.
+    rects = fit_zone_rects(An)
+    print("\nzone rectangles on the %dx%d sample grid (first column, columns, first row, rows):" % (SGW, SGH))
+    for z, (c0, nc, r0, nr) in enumerate(rects):
+        fa, _ = area_model([rects[z]], (0, 0, 0, 0))
+        worst = max(abs(a - b) for a, b in zip(fa[0], An[z])) / max(An[z])
+        print(f"  zone {z:2d}: {c0:3d} {nc:3d} {r0:2d} {nr:2d}   largest difference with the measured footprint {100 * worst:4.1f} % of its peak")
+    Af, Cf = area_model(rects, (0, 0, 0, 0))
+    Rf = ls_operator(Af)
+    def nnls_eval(sweeps):
         err = 0.0; n = 0
         for (f, m), gt in zip(main_val, gts):
             cell = [[0.0, 0.0, 0.0] for _ in range(GW * GH)]
             for c in range(3):
-                x = nnls_cells(Ac, [max(0.0, m[z][perm[c]] - lvl_black[c]) for z in range(NZ)], lam)
+                x = nnls_area(Af, Cf, Rf, [max(0.0, m[z][perm[c]] - lvl_black[c]) for z in range(NZ)], sweeps=sweeps)
                 for k in range(GW * GH):
                     cell[k][c] = to_ui(x[k] + lvl_black[c], c)
             img = upsample2(cell, GW, GH)
@@ -390,8 +459,9 @@ def main():
                 e = rect_mean(img, 2 * GW, 2 * GH, l)
                 err += sum(abs(a - b) for a, b in zip(e, g)); n += 3
         return err / n
-    nnls_mae = nnls_eval(NNLS_LAMBDA)
-    print(f"  non-negative solve lam={NNLS_LAMBDA:g}, cleaned footprints, up=1  MAE {nnls_mae:6.2f}")
+    nnls_mae = nnls_eval(NNLS_SWEEPS)
+    print(f"  non-negative solve on the zone rectangles, lam={NNLS_LAMBDA:g}, {NNLS_SWEEPS} sweeps, up=1  MAE {nnls_mae:6.2f}"
+          f"  (settled: {nnls_eval(400):.2f})")
     # Negative weights amplify read-to-read histogram noise (the double-buffered reads
     # alternate by a few units on moving video). Noise gain = largest row L1 norm.
     gain = lambda R: max(sum(abs(x) for x in row) for row in R)
@@ -412,8 +482,7 @@ def main():
     # --- header
     with open(out_h, "w") as f:
         f.write("// Generated by tools/calibrate.py from a --calib-dump capture. Do not edit by hand.\n")
-        f.write(f"// Method: {best_name}, 2x bilinear upsample: {int(best_up)}. Validation MAE {best_e:.2f}/255 "
-                "on HyperHDR LED rectangles.\n")
+        f.write("// Levels from the reference colours; zone geometry for the per-frame solve in src/ambilight.c.\n")
         f.write("#pragma once\n")
         f.write(f"#define PROFILE_COLS {GW}\n#define PROFILE_ROWS {GH}\n#define PROFILE_UPSAMPLE {int(best_up)}\n")
         f.write(f"// histogram channel that carries UI R, G, B\nstatic const int PROFILE_PERM[3] = {{{perm[0]}, {perm[1]}, {perm[2]}}};\n")
@@ -422,18 +491,14 @@ def main():
         f.write(f"static const float PROFILE_BLACK[3] = {{{fmt(lvl_black)}}};\n")
         f.write(f"static const float PROFILE_WHITE[3] = {{{fmt(lvl_white)}}};\n")
         f.write(f"static const float PROFILE_GAMMA[3] = {{{fmt(gam)}}};\n")
-        f.write("// cell colour (raw domain) = sum_z PROFILE_R[cell][z] * zone_mean[z]; cells row-major, top-left origin\n")
-        f.write(f"static const float PROFILE_R[{GW * GH}][16] = {{\n")
-        for row in best_R:
-            f.write("    {" + ", ".join(f"{x:.5f}f" for x in row) + "},\n")
-        f.write("};\n")
-        f.write("// Non-negative solve (16:9 pictures): zone_mean - black = sum_k PROFILE_A[zone][k] * cell[k], cell >= 0,\n")
-        f.write(f"// smoothness weight PROFILE_NNLS_LAMBDA. Validation MAE {nnls_mae:.2f}/255. Footprints below "
-                f"{NNLS_CLEAN:g} of a zone's\n// strongest cell are dropped, rows sum to 1.\n")
-        f.write(f"#define PROFILE_NNLS_LAMBDA {NNLS_LAMBDA:g}f\n")
-        f.write(f"static const float PROFILE_A[16][{GW * GH}] = {{\n")
-        for row in Ac:
-            f.write("    {" + ", ".join("0" if x == 0 else f"{x:.6f}f" for x in row) + "},\n")
+        f.write("// The TV samples the picture on a PROFILE_GRID_W x PROFILE_GRID_H grid; zone z is the rectangle\n")
+        f.write("// {first column, columns, first row, rows} of it (sample totals + measured footprints, see calibrate.py).\n")
+        f.write(f"// Non-negative solve over the picture area, smoothness PROFILE_NNLS_LAMBDA: validation MAE {nnls_mae:.2f}/255.\n")
+        f.write(f"#define PROFILE_GRID_W {SGW}\n#define PROFILE_GRID_H {SGH}\n")
+        f.write(f"#define PROFILE_NNLS_LAMBDA {NNLS_LAMBDA:g}\n")
+        f.write("static const int PROFILE_ZONE[16][4] = {\n")
+        for c0, nc, r0, nr in rects:
+            f.write(f"    {{{c0}, {nc}, {r0}, {nr}}},\n")
         f.write("};\n")
     print("wrote", out_h)
 
