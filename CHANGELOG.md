@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.2.5
+
+- The colour keys answer at once. Brightness and on/off now show in a small level of our own
+  at the top right instead of in the TV's messages: on screen 0.13-0.15 s after the press,
+  and the number follows every press of a run. The TV's messages cannot do that: one asked
+  for while another is visible only shows 2 s later, and each stays 5 s.
+- The level is a second, tiny app (`io.github.dimi3h.ambilight.osd`) in a transparent top
+  layer that takes no keys, so whatever is underneath keeps working. The service installs
+  and updates it from a copy in the package and removes it with the package. Without it the
+  TV's messages remain, now asked for once per run of presses (0.25 s after the last one)
+  and never queued behind one another.
+- Brightness runs from 5 to 100 % in steps of 5, and 100 % is the maximum. It was 10-300 %
+  with 100 % as "as measured"; that level is now called 50 %. Same light, new number: a
+  stored setting keeps its light, and one above the new maximum becomes 100 %.
+
 ## 0.2.4
 
 - Black bars, redone. The bar height is measured from the TV's sample grid (black share of

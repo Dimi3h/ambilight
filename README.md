@@ -90,9 +90,9 @@ Open **Ambilight** from the TV's app list. With the remote (▲▼ choose, OK ch
   the LEDs off and the histogram open, so protected content has colours again at once when
   you switch back on);
 - use the remote's **colour keys**: blue switches ambilight on and off, green dims and
-  yellow brightens in steps of 10 % (a short on-screen message confirms it);
+  yellow brightens in steps of 5 % (a small level at the top right shows it at once);
 - set the HyperHDR address, port and priority;
-- adjust brightness (10–300 %; it scales everything sent to the LEDs, picture and menus);
+- adjust brightness (5–100 %; it scales everything sent to the LEDs, picture and menus);
 - switch black-bar detection and UI blending (menus, subtitles) on or off;
 - check for and install updates;
 - see the live state: picture source, HyperHDR connection, detected bars, frames/s,
@@ -106,6 +106,15 @@ holding yellow for 5 s starts an LG test-pattern function, and seven quick press
 on an HDMI input show LG's FreeSync information. Why colour keys and not a dedicated button
 such as LG Channels: see the findings (LG re-applies its button table from its server at
 every boot).
+
+The level that the colour keys show is a second, very small app,
+`io.github.dimi3h.ambilight.osd`. It has no entry in the app list. Its window is a
+transparent top layer that takes no keys, so the app you are watching keeps working
+underneath, and it appears 0.13–0.15 s after a press (the TV's own messages take 2 s when
+one is already on screen). The TV only registers one app per package, so the service installs
+this one from a copy inside the main package (`ambilightctl osd`, at setup and after every
+update) and removes it when the main package goes. If it is missing, the TV's messages are
+used instead.
 
 Changes apply immediately, without restarting the service. The app runs
 `ambilightctl` through Homebrew Channel's public `exec` method; every value is checked
@@ -121,7 +130,8 @@ $C pause | resume         # LEDs off / on, the service keeps running (what the a
 $C stop                   # service off, stays off across reboots
 $C start                  # on again (also clears the guards below and a pause)
 $C set gain=1.2 uiblend=off   # change settings live: host, port (1-65535), priority (1-253),
-                              # gain (0.1-3.0), letterbox|uiblend|colorkeys on|off
+                              # gain (0.1-2.0; the app and the remote show it as brightness
+                              # 5-100 % = gain x 50), letterbox|uiblend|colorkeys on|off
 $C json-status            # everything as JSON (used by the settings app)
 $C check-update           # read the release feed now
 $C setup                  # elevate + boot hook + start (the app runs this on first start)

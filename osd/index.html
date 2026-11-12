@@ -1,0 +1,72 @@
+<!doctype html>
+<!-- The on-screen level of the brightness keys: a second, tiny app, shown by the service. Its
+     window type is "topui": a transparent top layer that takes no keys, so the app underneath
+     keeps working while the level is on screen (an "overlay" window takes every key, whatever
+     key mask is set). After 1.5 s the window is hidden; the page stays loaded, so the next
+     press shows within about 0.1 s.
+
+     All measured on the B4: the TV puts the window on screen at the first frame with something
+     drawn in it, and a window hidden before that moment never appears again, whatever is
+     launched later. So the page never hides an empty window: loaded ahead of the first key
+     press it draws the box once, too faint to see, and hides after that. A window that is
+     off screen gets next to no animation frames (a handful against 60 per second), which is
+     how the page notices that it was never drawn; it then closes itself. -->
+<html lang="nl"><head><meta charset="utf-8"><title>Ambilight</title>
+<style>
+  html, body { margin: 0; width: 100%; height: 100%; background: transparent; overflow: hidden;
+               font-family: "LG Smart UI", "Museo Sans", sans-serif; }
+  #box { position: absolute; right: 64px; top: 64px; width: 470px; padding: 24px 30px 28px; border-radius: 20px;
+         background: rgba(22, 24, 28, 0.9); color: #fff; opacity: 0; transition: opacity 150ms linear;
+         box-shadow: 0 8px 30px rgba(0, 0, 0, 0.45); }
+  #row { display: flex; justify-content: space-between; align-items: baseline; }
+  #lab { font-size: 30px; color: rgba(255, 255, 255, 0.82); }
+  #num { font-size: 44px; font-weight: 600; }
+  #track { margin-top: 18px; height: 10px; border-radius: 5px; background: rgba(255, 255, 255, 0.2); overflow: hidden; }
+  #fill { height: 100%; width: 0; background: #fff; }
+</style></head>
+<body>
+<div id="box"><div id="row"><span id="lab">Ambilight</span><span id="num"></span></div><div id="track"><div id="fill"></div></div></div>
+<script>
+(function () {
+  var HOLD_MS = 1500, FADE_MS = 170, MIN_FRAMES = 20, FAINT = 0.01;
+  var sys = window.webOSSystem || window.PalmSystem;
+  var box = document.getElementById('box'), lab = document.getElementById('lab'), num = document.getElementById('num');
+  var track = document.getElementById('track'), fill = document.getElementById('fill');
+  var timer = null, counting = false, frames = 0;
+  function count() { frames++; if (counting) requestAnimationFrame(count); }
+  // Off the screen again; the page stays loaded. A window that was never drawn (see the top of
+  // this file) closes instead, so that the next key press starts a fresh one.
+  function leave() {
+    counting = false; timer = null;
+    try { if (frames < MIN_FRAMES) window.close(); else sys.hide(); } catch (e) {}
+  }
+  function show(p) {
+    var level = p && typeof p.pct === 'number', state = p && (p.state === 'on' || p.state === 'off');
+    // Anything else only loads the page ahead of the first key press. Every launch puts the
+    // window on screen, so that one runs the same course, with a box too faint to see.
+    if (!level && !state && timer !== null) return;   // a level is on screen: leave it be
+    clearTimeout(timer);
+    if (level) {                                // brightness, 5-100 %
+      var pct = Math.max(0, Math.min(100, Math.round(p.pct)));
+      lab.textContent = 'Ambilight helderheid';
+      num.textContent = pct + '%';
+      track.style.display = '';
+      fill.style.width = pct + '%';
+    } else if (state) {
+      lab.textContent = 'Ambilight';
+      num.textContent = p.state === 'on' ? 'Aan' : 'Uit';
+      track.style.display = 'none';
+    }
+    if (!counting) { counting = true; frames = 0; requestAnimationFrame(count); }
+    box.style.opacity = level || state ? 1 : FAINT;
+    timer = setTimeout(function () {
+      box.style.opacity = 0;
+      timer = setTimeout(leave, FADE_MS);
+    }, HOLD_MS);
+  }
+  function parse(s) { try { return typeof s === 'string' ? JSON.parse(s) : s; } catch (e) { return null; } }
+  if (sys) show(parse(sys.launchParams));
+  document.addEventListener('webOSRelaunch', function (e) { show(parse(e.detail)); });
+})();
+</script>
+</body></html>

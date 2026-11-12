@@ -901,3 +901,90 @@ two small swings (13.2 <-> 14.8 %) in the first seconds, from a dark scene next 
 the 15 s rule for small growth was added after that and is only tested offline. CPU 14 %.
 
 Not measured: 4:3 content on the TV (only in the unit test), bars that are not black.
+
+## An on-screen level of our own for the colour keys (2026-11-12, 0.2.5)
+
+The messages of the colour keys came late. Everything below was measured on the B4.
+
+### The TV's messages (toasts) cannot be fast
+
+`com.webos.notification/createToast`, timed with the surface-manager log:
+
+- nothing on screen: visible about 0.1 s after the call;
+- a toast on screen: the new one shows 2 s after its request, and requests behind it wait
+  2 s each;
+- every toast stays 5 s. `timeout`, `duration` and `showTimeout` in the request change
+  nothing, and `closeToast` does not take a visible toast away.
+
+So a run of presses can never be followed live with toasts. What is left for them (and
+still used when the level app is missing): one toast per run, asked for 0.25 s after the
+last press (0.6 s after the first if the presses keep coming and nothing of ours is on
+screen), and never while an earlier one of ours has not shown yet.
+
+### A window on top that leaves the keys alone
+
+- A web app with `"defaultWindowType":"overlay"` shows on top of the running app but takes
+  every key: arrows and OK no longer reached the app underneath, with `setKeyMask([])`, with
+  `["KeyMaskRemoteColorRed"]` and with `["KeyMaskDefault"]` alike.
+- `"defaultWindowType":"topui"` is the compositor's `StarfishTopUIView`
+  (`SurfaceView { layerNumber: 5; enabled: false }` in its QML): a transparent top layer
+  that receives no keys at all (0 key events in the page, and the remote kept working
+  underneath, checked by hand).
+- The app manager registers only the app that a package's `packageinfo.json` names. A second
+  app directory inside the main package is ignored ("Invalid appId specified" on launch).
+  Hence the level is a package of its own, `io.github.dimi3h.ambilight.osd`, carried as
+  `osd.ipk` in the service directory and installed with
+  `com.webos.appInstallService/dev/install` by `ambilightctl osd` when the installed
+  version differs.
+- The service shows a value by launching the app with parameters
+  (`com.webos.applicationManager/launch`). With `handlesRelaunch` a loaded app gets them in
+  a `webOSRelaunch` event; `webOSSystem.hide()` takes the window off the screen and leaves
+  the page loaded.
+
+### When the window reaches the screen
+
+The first version was loaded ahead with empty parameters and hidden at once. On the TV
+nothing ever appeared after that. Measured with a page that reports its own state:
+
+| case | window on screen (surface-manager log) |
+| --- | --- |
+| cold launch with a value | 0.21-0.58 s after the launch call |
+| relaunch of a loaded, hidden page with a value | 0.10-0.14 s |
+| cold launch that draws nothing (box at opacity 0) | not in the 5 s watched, while `document.visibilityState` says `visible` and animation frames run at 60 per second |
+| ... then a value | 1.12 s later (twice the same figure) |
+| a 2x2 px, 2 % dot always drawn | not enough: nothing in the 1 s before it was hidden |
+| `hide()` before the window was on screen, then any launch | never again (three launches tried); the page gets 1-6 animation frames in 1.7 s instead of about 100 |
+| cold launch that draws the box at opacity 0.01, hidden after 1.7 s | on screen at 0.24 s, later values at 0.11 s |
+
+So the TV brings the window to the screen at the first frame with real content, and a window
+hidden before that stays away for good, also for later launches. The page therefore never
+hides an empty window. Loaded ahead of the first press (the service does that 20 s after its
+start) it runs the normal course with the box at 1 % opacity. And as a safeguard it counts
+its animation frames while showing: fewer than 20 by the time it leaves means the window was
+never drawn, and it closes itself, so that the next press starts a fresh one (tested by
+provoking the state: closed, next launch visible after 0.21 s).
+
+A relaunch always puts the window back on screen, also with empty parameters; an empty one
+therefore runs the same faint course, unless a value is showing.
+
+### Result
+
+- 40 presses on the real remote: the launch call reaches the app manager 18-27 ms after the
+  key event; the two presses that found it hidden had it on screen after 128 and 148 ms,
+  and during a run it is already there.
+- By eye: immediate, the number follows every press, arrows and OK keep working underneath.
+- After a restart of the service its own pre-load showed (faint) at 0.20 s and left after
+  1.6 s; the next value was on screen in 0.14 s.
+
+### Brightness scale
+
+Shown brightness = gain x 50, from 5 to 100 % in steps of 5 (gain 0.1-2.0, steps of 0.1).
+100 % is the maximum; the level that used to be called 100 % ("as measured", gain 1.0) is
+50 %. The settings file and `ambilightctl set gain=` keep the gain; a stored gain above 2.0
+is set to 2.0.
+
+### Not measured
+
+The level over protected video, after standby with Quick Start+, what happens when the TV
+discards the loaded page for memory (expected: a cold launch, 0.2-0.6 s), and the removal of
+the level app together with the main package (written, not run on the TV).
