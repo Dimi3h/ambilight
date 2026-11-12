@@ -94,7 +94,8 @@
         return ok();
       }
       var st = s.running ? { t: Date.now() / 1000 | 0, version: s.version, hist: 'open', fps: s.paused ? 0 : 20, reopens: 0,
-        letterbox: s.settings.letterbox ? s.letterbox : 0, hyperhdr: true, paused: s.paused } : null;
+        letterbox: s.settings.letterbox ? s.letterbox : 0, bars: s.settings.letterbox ? [13.2, 13.2, 0, 0] : [0, 0, 0, 0],
+        hyperhdr: true, paused: s.paused } : null;
       return Promise.resolve(JSON.stringify({ running: s.running, supervisor: s.running, autostart: s.autostart,
         paused: s.paused, disabled: s.disabled, boot_count: s.boot_count, version: s.version, settings: s.settings,
         update: s.update, status: st,
@@ -152,6 +153,19 @@
     run('setup', 'Ambilight is ingesteld en gestart');
   }
 
+  // Black bars as the service reports them: percent of the picture height (top, bottom) and
+  // width (left, right). An older service only has the height in rows of 36.
+  function barsText(st) {
+    var b = st.bars;
+    if (!b) return st.letterbox ? '≈' + Math.round(st.letterbox * 100 / 36) + '% boven en onder' : 'Geen';
+    var parts = [];
+    if (b[0] > 0 || b[1] > 0) parts.push('boven en onder ' + Math.round((b[0] + b[1]) / 2) + '%');
+    if (b[2] > 0 || b[3] > 0) parts.push('links en rechts ' + Math.round((b[2] + b[3]) / 2) + '%');
+    if (!parts.length) return 'Geen';
+    var t = parts.join(', ');
+    return t.charAt(0).toUpperCase() + t.slice(1);
+  }
+
   function render() {
     if (!data) return;
     var st = data.status, s = data.settings, guard = data.disabled && !/stopped by ambilightctl/.test(data.disabled);
@@ -166,8 +180,7 @@
     $('sSource').textContent = !data.running ? '–' : !st ? 'Opstarten' :
       st.hist === 'open' ? 'Histogram (16 zones)' : 'Wacht op onbeveiligd beeld';
     $('sHyper').textContent = s.host + ':' + s.port + (st && on ? (st.hyperhdr ? ' · verbonden' : ' · niet bereikbaar') : '');
-    $('sBars').textContent = !s.letterbox ? 'Herkenning uit' : !st || !on ? '–' :
-      st.letterbox ? st.letterbox + ' rijen (≈' + Math.round(st.letterbox * 100 / 36) + '% boven en onder)' : 'Geen';
+    $('sBars').textContent = !s.letterbox ? 'Herkenning uit' : !st || !on ? '–' : barsText(st);
     $('sFps').textContent = st && on ? Math.round(st.fps) : '–';
     $('sAuto').textContent = data.autostart ? 'Aan' + (data.boot_count ? ' · opstartteller ' + data.boot_count + '/3' : '') : 'Niet ingesteld';
     $('sVersion').textContent = data.version || '–';

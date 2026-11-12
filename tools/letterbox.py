@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
-"""Letterbox analysis: histogram presets, black-bar detector and reconstruction strategies.
+"""Letterbox analysis: histogram presets, black-bar measurement and reconstruction strategies.
 
-usage: letterbox.py <lb.txt> <cal.txt> <leds.json> <profile_b4.h> [--emit header.h]
+usage: letterbox.py <lb.txt> <cal.txt> <leds.json> <profile_b4.h>
+
+The service no longer needs a generated header for the bars: it measures them from the dark
+shares and the zone rectangles in profile_b4.h and solves over the picture area. This script
+checks that method (and the earlier ones) against the capture.
 
 lb.txt  : `ambilight --calib-dump --calib-presets 0,1,2,3` capture of patterns/letterbox.html
           (64x36 UI ground truth, "B" dark fractions, "P" preset switches)
@@ -91,15 +95,11 @@ def stretch(img, w, h, ht, hb, ow, oh):
 
 
 def main():
-    args = sys.argv[1:]
-    emit = None
-    if "--emit" in args:
-        i = args.index("--emit"); emit = args[i + 1]; del args[i:i + 2]
-    lbp, calp, ledp, profp = args
+    lbp, calp, ledp, profp = sys.argv[1:]
     leds = json.load(open(ledp))
     hdr = open(profp).read()
     num = lambda s: list(map(float, re.findall(r"(-?\d+\.\d+)f", s)))
-    R0 = [num(r) for r in re.findall(r"\{([^{}]*)\},\n", hdr.split("PROFILE_R[144][16]")[1])]
+    rects = [tuple(map(int, r.split(","))) for r in re.findall(r"\{(\d+, \d+, \d+, \d+)\}", hdr)]
     blk = num(hdr.split("PROFILE_BLACK[3] = ")[1].split(";")[0])
     wht = num(hdr.split("PROFILE_WHITE[3] = ")[1].split(";")[0])
     gam = num(hdr.split("PROFILE_GAMMA[3] = ")[1].split(";")[0])
@@ -193,6 +193,35 @@ def main():
         AtA = [[sum(Aw[z][i] * Aw[z][j] for z in range(NZ)) for j in range(GW * GH)] for i in range(GW * GH)]
         return cal.solve([[AtA[i][j] + LAM * L[i][j] for j in range(GW * GH)] for i in range(GW * GH)],
                          [[Aw[z][i] for z in range(NZ)] for i in range(GW * GH)])
+    R0 = ls_op(A0n)  # the fixed full-frame operator of the first versions
+
+    # the service's method: solve over the picture area on the exact zone rectangles
+    def recon_area(m, top, bot):
+        A, Cv = cal.area_model(rects, (0, 0, top * cal.SGH / LH, bot * cal.SGH / LH))
+        Rs = cal.ls_operator(A)
+        cell = [[0.0] * 3 for _ in range(GW * GH)]
+        for c in range(3):
+            x = cal.nnls_area(A, Cv, Rs, [max(0.0, m[z][c] - blk[c]) for z in range(NZ)])
+            for k in range(GW * GH):
+                cell[k][c] = lvl(x[k] + blk[c], c)
+        return cal.upsample2(cell, GW, GH)  # already the cropped, stretched picture
+    def led_err_direct(out32, ht, hb, target):
+        return sum(abs(a - b) for l, g in zip(leds, target) for a, b in zip(cal.rect_mean(out32, 32, 18, l), g)) / (3 * len(leds))
+
+    # ... and its bar measurement: black share (level 4 or lower) x zone size, smallest among the
+    # zones at that edge that are not black all over; the larger of an agreeing pair
+    def measure(lo):
+        beta = [min(lo[z][c][0] for c in range(3)) for z in range(NZ)]
+        def edge(pick, size):
+            v = [beta[z] * size(z) for z in range(NZ) if pick(z) and beta[z] * size(z) < size(z) - 1.0]
+            return min(v) if v else None
+        top = edge(lambda z: rects[z][2] == 0 and rects[z][3] < cal.SGH, lambda z: rects[z][3])
+        bot = edge(lambda z: rects[z][2] + rects[z][3] == cal.SGH and rects[z][3] < cal.SGH, lambda z: rects[z][3])
+        if top is None or bot is None:
+            return None
+        bot += 1  # the grid's last row is garbage, not dark, but part of the bar (this capture predates its removal)
+        s_, m_ = min(top, bot), max(top, bot)
+        return 0.0 if s_ < 2 else (m_ if m_ <= s_ + 1.5 else s_ + 1.5)
 
     # bar model: fraction of each 16x9 cell inside top/bottom bars of height ht/hb
     def bar_frac(ht, hb):
@@ -233,15 +262,16 @@ def main():
             if all(beta[z] >= e[z] - tol for z in range(NZ)):
                 best = h
         return best
-    print("\ndetector (preset 0; symmetric bars; rows of 36): true -> detected for thresholds", LOW_T)
+    print("\nbars: true (rows of 36) -> old detector for thresholds", LOW_T, "| measured by the service's method, in samples (true in samples)")
     for f, m, lo, (top, bot) in imgs0:
         det = [round(detect(lo, j) * LH) for j in range(4)]
-        print(f"  bars {top},{bot}  ->  {det}")
+        ms = measure(lo)
+        print(f"  bars {top},{bot}  ->  {det}  |  {'undecided' if ms is None else f'{ms:5.2f}'} ({top * cal.SGH / LH:5.2f})")
 
     # ---------- strategies vs the stretched target (oracle bar heights)
     print("\nstrategy MAE per image vs stretched-picture target (oracle bar heights):")
-    print("  bars | current(no crop) | crop only | preset0+bar model | preset1")
-    tot = [0.0, 0.0, 0.0, 0.0]; nb = 0
+    print("  bars | no handling | crop only | operator per bar height | preset1 | solve over the picture area (service)")
+    tot = [0.0, 0.0, 0.0, 0.0, 0.0]; nb = 0
     for f, m, lo, (top, bot) in imgs0:
         tg = gt(f, top, bot); ht, hb = top / LH, bot / LH
         e_cur = led_err(recon(R0, m), 0, 0, tg)
@@ -249,34 +279,15 @@ def main():
         e_bar = led_err(recon_bar(m, ht, hb), ht, hb, tg) if (top or bot) else e_crop
         m1 = imgs1.get(key(f))
         e_p1 = led_err(recon(R1, m1), ht, hb, tg) if (R1 and m1) else float("nan")
-        print(f"  {top:2d},{bot:2d} | {e_cur:8.2f}         | {e_crop:8.2f}  | {e_bar:8.2f}          | {e_p1:8.2f}")
+        e_new = led_err_direct(recon_area(m, top, bot), ht, hb, tg)
+        print(f"  {top:2d},{bot:2d} | {e_cur:8.2f}    | {e_crop:8.2f}  | {e_bar:8.2f}                | {e_p1:8.2f}| {e_new:8.2f}")
         if top or bot:
-            for j, e in enumerate((e_cur, e_crop, e_bar, e_p1)):
+            for j, e in enumerate((e_cur, e_crop, e_bar, e_p1, e_new)):
                 tot[j] += e
             nb += 1
     if nb:
-        print("  mean over letterboxed images: current %.2f | crop %.2f | bar model %.2f | preset1 %.2f"
-              % tuple(x / nb for x in tot))
-
-    if emit:
-        # operators for bar heights 1..7 rows of 36 (symmetric), raw domain, plus the
-        # bar contribution per zone so the service can subtract it
-        with open(emit, "w") as fo:
-            fo.write("// Generated by tools/letterbox.py. Do not edit by hand.\n#pragma once\n")
-            fo.write(f"#define LB_LEVELS 7\n// bar height of level i = (i + 1) / {LH} of the frame, top and bottom\n")
-            fo.write("static const float LB_R[LB_LEVELS][144][16] = {\n")
-            darks = []
-            for lv in range(1, 8):
-                h = lv / LH
-                Rop, phi = bar_op(h, h)
-                darks.append([sum(A0n[z][k] * phi[k] for k in range(GW * GH)) for z in range(NZ)])
-                fo.write("  {\n" + "".join("    {" + ", ".join(f"{x:.5f}f" for x in row) + "},\n" for row in Rop) + "  },\n")
-            fo.write("};\n// share of each zone covered by the bars at each level (expected dark fraction)\n")
-            fo.write("static const float LB_BAR_SHARE[LB_LEVELS][16] = {\n")
-            for d in darks:
-                fo.write("    {" + ", ".join(f"{x:.5f}f" for x in d) + "},\n")
-            fo.write("};\n")
-        print("wrote", emit)
+        print("  mean over letterboxed images: no handling %.2f | crop %.2f | operator per bar height %.2f | preset1 %.2f | "
+              "solve over the picture area %.2f" % tuple(x / nb for x in tot))
 
 
 if __name__ == "__main__":
