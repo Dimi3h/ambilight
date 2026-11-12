@@ -214,20 +214,23 @@ AMBI_SSH_KEY=~/.ssh/<your-tv-key> tools/uninstall.sh <tv-ip>
 
 Stops the service (it clears its HyperHDR priority), removes the boot hook, copies the
 logs to `backups/<date>-uninstall/`, removes the package (and with it its Luna files),
-turns PicCap's autostart back on if the installer turned it off, and deletes
-`/media/developer/ambilight`. Add `--keep-state` to keep the logs on the TV.
+turns PicCap's autostart back on if the installer turned it off and PicCap is still
+installed, and deletes `/media/developer/ambilight`. Add `--keep-state` to keep the logs on
+the TV.
 
 Manually, over SSH as root, the same steps are:
 
 ```sh
 rm -f /var/lib/webosbrew/init.d/70-ambilight
 /media/developer/apps/usr/palm/services/io.github.dimi3h.ambilight.service/ambilightctl stop
+luna-send -n 1 luna://com.webos.appInstallService/dev/remove '{"id":"io.github.dimi3h.ambilight.osd"}'
 luna-send -n 1 luna://com.webos.appInstallService/dev/remove '{"id":"io.github.dimi3h.ambilight"}'
-luna-send -n 1 luna://org.webosbrew.piccap.service/setSettings '{"autostart":true}'   # if you had it on
+luna-send -n 1 luna://org.webosbrew.piccap.service/setSettings '{"autostart":true}'   # if you had it on and PicCap is still there
 rm -rf /media/developer/ambilight
 ```
 
-(`luna-send` prints its reply only on a terminal: use `ssh -t`.)
+(`luna-send` prints nothing when its standard input is a closed pipe: use `ssh -t`, or add
+`< /dev/null` to the command.)
 
 ## Known limits
 
