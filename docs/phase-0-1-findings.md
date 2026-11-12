@@ -988,3 +988,182 @@ is set to 2.0.
 The level over protected video, after standby with Quick Start+, what happens when the TV
 discards the loaded page for memory (expected: a cold launch, 0.2-0.6 s), and the removal of
 the level app together with the main package (written, not run on the TV).
+
+## White point, subtitles and automatic updates (2026-11-12, 0.2.6)
+
+### A way to measure over any picture
+
+The level app's window is a transparent top layer, so a test colour can be laid over
+whatever plays: a development copy of its page takes `{"fill":"#rrggbb"}` and fills the
+screen. The running service writes the raw bins on request (`--hist-dump`, or `--snap` for
+the bins and the UI plane of the same moment) through the args file and a reload, so nothing
+is restarted and the method is safe during protected video. A page that only draws a
+background does not bring a new window to the screen (first seen after 6 s); showing the
+level once first makes every colour a relaunch of a loaded page. The tools are in
+`probe/measure/` (`level_dev.py` makes the page; `patch.sh`, `sweep.sh`, `snaprun.sh` and
+`subtest.sh` run on the TV), the bins of the white measurements below in
+`probe/data/2026-11-12/white/`. Snapshots of the UI plane show what was on the screen and
+are not kept.
+
+`luna-send` writes its replies to a pipe as well as to a terminal, one line per reply and at
+once, also with `-i` and `"subscribe":true`. What it cannot have is a closed pipe as its
+standard input: then it prints nothing (`true | luna-send -n 1 ...` gives no output, the same
+call with `< /dev/null` does). That, not the missing terminal, is what an earlier note in
+these findings ran into.
+
+### The histogram's white is the colour temperature's white
+
+White, grey steps and the primaries in the top layer, over SDR video (VRT MAX, picture mode
+`cinema`, colour temperature -50) and over HDR10 video (YouTube, `hdrCinemaBright`, -30):
+
+| | SDR, -50 | HDR10, -30 |
+| --- | --- | --- |
+| white | 253.7 236.8 205.1 | 253.9 240.0 221.2 |
+| grey 128 / white | 0.500 0.502 0.502 | 0.503 0.503 0.501 |
+| pure red | 253.6 0.2 0.2 | 253.7 0.2 0.2 |
+
+- Over real video the SDR white is the profile's white (253.4, 236.6, 204.9): the factor 0.79
+  seen on the home screen belongs to the home screen, not to video.
+- In HDR the scale is the same and still linear; only the white differs.
+- With the user's leave the colour temperature and the picture mode were switched for two
+  minutes while the HDR video played (and put back, verified). Nine temperatures in one mode:
+
+  | setting | -50 | -40 | -30 | -20 | -10 | 0 | 10 | 25 | 50 |
+  | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+  | R | 253.8 | 254.0 | 253.8 | 253.6 | 253.8 | 253.7 | 252.0 | 249.8 | 246.7 |
+  | G | 237.0 | 238.1 | 239.9 | 239.7 | 240.9 | 241.8 | 241.1 | 239.9 | 239.7 |
+  | B | 205.3 | 213.3 | 221.2 | 227.7 | 236.0 | 243.9 | 246.0 | 248.8 | 253.6 |
+
+  Six picture modes (`hdrVivid` 50, `hdrStandard` and `hdrEco` 20, `hdrCinemaBright` -30,
+  `hdrCinema` -50, `hdrGame` 0) each gave exactly the white of their temperature, with the
+  same grey ratios and a pure red, whatever their contrast, colour and dynamic settings. So
+  the white depends on the colour temperature alone (`src/whitepoint_b4.h`). `hdrFilmMaker`
+  gave the right white but an odd red and `hdrPersonalized` read nonsense: both taken as
+  failed measurements, not followed up. White-balance fine tuning (all zero here) is not
+  measured.
+- Video is limited to the same white: in 60 reads of SDR video no blue sample lay above 207
+  (white 205.1), in HDR video none above 222 (white 221.2). So one white serves video and UI.
+- A white field's highest blue bin lies 1 above its mean, for all ten settings.
+
+### The TV's settings do not tell which white is in force
+
+`com.webos.settingsservice` reports the dynamic range (`dimensionInfo`) and the picture mode
+and colour temperature (`picture`), also as subscriptions, and they followed every switch.
+But with an HDR10 film on Disney+ they said `hdrCinemaBright`, -30, while a white field read
+(253.7, 236.8, 205.1): the white of -50. Writing -30 again changed nothing (measured before
+and after). On YouTube in HDR10, an hour earlier, the same reported mode did read as -30.
+Cause not found (protected playback, the app, or how the stream started in SDR and switched).
+In 160 s of that film no blue sample lay above 206.
+
+(The user had chosen the film as Dolby Vision; the TV played it as HDR10:
+`videooutput/getStatus` `hdrType`, and `is_stream_play_as_dolby_vision: false` in the log.
+Real Dolby Vision is not measured.)
+
+The picture alone does not tell either. White is the bluest a neutral picture gets, and
+blue of white rises steadily from 205 to 254 along the table, so the highest blue level seen
+looked like a measure: per frame the highest blue bin with 8 samples at or above it, over the
+ten zones that stay clear of the grid's last row (13,255 samples). On the first recordings it
+fitted: SDR video on VRT MAX at most 207 (a white of 205 gives 206), YouTube HDR 219-222 (221
+gives 222), the Disney+ film at most 195. A first version built on that alone failed on the
+TV within minutes:
+
+- An SDR film on Plex (white at 205, the reported -50 correct) had blue up to 219 in 8 of 40
+  reads a second apart, while green never passed its white (237). Saturated blue goes above
+  white's blue: the estimate moved to -40 and -35.
+- The home screen and Disney+'s menu showed blue up to 222 where the films after them had
+  their white at 205. Screens that are mostly UI are not processed like video (the factor
+  0.79 above is another sign of that).
+
+What is built: the profile's white (-50) is used until the picture confirms the setting the
+TV reports. A white that is in force shows as a ceiling: within the last minute at least 40
+frames have their highest blue level at that white (within 1.5 bins of the highest bin of a
+white field) and at most one eighth as many lie above it. Blue that passes through that
+level on its way up does not look like that. The verdict starts again when the TV reports
+another app, dynamic range, picture mode or colour temperature (1.5 s to settle), frames
+with more than half the screen under UI do not count, and a confirmed white is given up
+only when blue plainly goes above it. The white in use moves at half a step per frame.
+
+On the TV: YouTube in HDR10 (reported `hdrCinemaBright`, -30) was confirmed 23 s after the
+video started (40 frames at its white, none above) and held; in the user's SDR apps the
+reported setting is the profile's own, so nothing can change there; the Disney+ HDR case
+(reported -30, white at 205) was not played again with this version: by construction, and
+in the unit test with the recorded levels, it stays at the profile's white.
+
+Weak spots, by design: a picture that never shows white keeps the profile's white (for HDR
+on YouTube: blue 8 % too strong, as before); and where the TV reports the profile's setting
+while another white is in force, nothing notices. Neither was seen.
+
+### Subtitles
+
+Snapshots of the UI plane (320x180) and the bins of the same moment:
+
+| | VRT MAX | Disney+ |
+| --- | --- | --- |
+| text | yellow, dark outline | white (about 240), thin |
+| share of the plane | 0.64-1.07 % | 0.18-0.45 % |
+| box | x 108-212, y 157-174 | x 109-211, y 152-168 |
+| lift of the bottom-centre zone (1746 samples) | 7.6-11.9 of 255 in R and G | 1.8-4.4 |
+
+- The text's samples cannot be picked out of the bins. Where the capture promised 70-100
+  samples of yellow, 20-25 sat at yellow's level (R 253-254, G 236-238); the rest is spread
+  over everything between the picture and the text, because a stroke is a few 4K samples
+  wide and most hits land on its soft edge.
+- So the text is taken out of the zone's mean: with A = sum of alpha and S = sum of alpha x
+  colour over the zone's part of the capture, video = (mean x N - A x black - S x (white -
+  black) / 255) / (N - A). Under a picture darker than the text's own lift another 30 % of
+  that lift is taken off, so that black stays black; the capture only tells the text's
+  share to about a third.
+- A subtitle is recognised by where it is: the plane is nearly empty (0.02-3 %), and what it
+  shows fits a box at most 85 % wide and 30 % high, centred within 20 % of the middle, that
+  lies in the lower half or the upper 40 %. The level of the colour keys (top right) and a
+  menu are not subtitles.
+- While a subtitle shows it is not laid over the picture, and top and bottom bars are not
+  judged (text in a bar used to shrink it).
+- A spike in a film's histogram that looked like the subtitle colour turned out to be flat
+  video content in zones the text does not reach: only the zones tell.
+
+On the TV, with two lines of subtitle-like text shown and hidden every 1.3 s by a
+development copy of the level app over a playing film (bottom-centre zone, mean with the
+text minus the mean without it, +- standard error):
+
+| | filter off | predicted from the capture | filter on |
+| --- | --- | --- | --- |
+| white text, 12 cycles | R +4.3 +-2.0, G +6.4 +-1.4, B +5.4 +-1.3 | +4.8 +4.9 +4.4 | R +0.9 +-2.0, G +0.8 +-1.2, B +0.4 +-1.0 |
+| yellow text with outline, 16 cycles | R +7.1 +-1.1, G +5.7 +-1.3, B -2.7 +-0.9 | +5.3 +5.7 -1.3 | not decided: the film moved more than the text added |
+
+So the capture predicts the text's light to within the noise, and with the filter the white
+text leaves under 1 of 255. For yellow only the prediction is confirmed; the run with the
+filter on fell in a restless part of the film (the control zone at the top moved by 4).
+A still, dark picture under real subtitles has not been measured; the unit test covers it.
+
+### Automatic updates
+
+`ambilightctl maintain` (daily) downloads a newer release to the state directory when
+automatic updates are on, and checks it against the feed's SHA-256. It is installed with
+`appInstallService/dev/install`, as the level app is, at one of two moments: by the
+supervisor when the TV starts, before the service runs (not if a streaming app is already
+in the foreground), or when the service has seen the home screen in the foreground for a
+minute. At most
+three attempts per version. The supervisor and `ambilightctl` are replaced by the install
+while they run: each does the step inside one compound command, which the shell has read
+completely before it starts.
+
+On the TV, with a development build staged as the downloaded update:
+
+- Home screen: 73 s and 89 s after the home screen came up the service asked for the
+  install; `ambilightctl` installed it within 1 s, the service noticed its executable was
+  replaced 4.5 s later and the new one had the histogram open 4.6 s after that. With a film
+  playing in another app the same call does nothing.
+- Start of the TV (after a restart): the supervisor installed it before the service's first
+  start and handed over to the new supervisor; the service was up 105 s after the restart.
+- Switching the TV off for 20 s is not a start: it goes to `Active Standby`
+  (`tvpower/power/getPowerState`), every process keeps running (the histogram was away for
+  139 ms) and it comes back as it was. A cold start was seen once after a longer time off.
+- Found on the way: Homebrew Channel starts the boot hook without `PATH` in its
+  environment. The shell finds its own commands, but `elevate-service` then fails in LG's
+  `ls-control` ("sleep: not found"), so after any update handled by a supervisor that was
+  started at boot the elevation failed. The scripts now set `PATH` themselves.
+
+Everything under `/media/developer` is world-writable on this TV (the installer makes
+directories and files 777), the service directory included. Automatic updates add nothing
+to that: who can write there could already replace what runs as root.

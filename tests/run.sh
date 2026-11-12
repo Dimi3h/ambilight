@@ -12,6 +12,7 @@ done
 "$out/test_compose"
 "$out/test_recon"
 "$out/test_keys"
+"$out/test_tv"
 "$out/test_png" "$out/test.png"
 python3 -I tests/check_png.py "$out/test.png"
 for f in service/*.sh service/ambilightctl tools/*.sh build.sh; do sh -n "$f"; done

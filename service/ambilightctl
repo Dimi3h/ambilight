@@ -14,13 +14,23 @@
 #                      brightness 5-100 %: brightness = gain x 50),
 #                      letterbox (on|off), uiblend (on|off), colorkeys (on|off: on the
 #                      remote blue toggles ambilight, green dims, yellow brightens; the old
-#                      name bluekey is still accepted). Prints {"ok":...}.
+#                      name bluekey is still accepted), subfilter (on|off: keep subtitles
+#                      off the LEDs), autoupdate (on|off: install new versions unasked, see
+#                      auto-update). Prints {"ok":...}.
 #   setup              first run after an install from Homebrew Channel: elevate the
 #                      service, add the boot hook, start
 #   elevate            (re)grant the service its permissions through Homebrew Channel
 #   check-update       read the release feed now; prints the update info as JSON
-#   maintain           periodic upkeep (run by the service): daily update check
+#   auto-update boot|idle   install the update that maintain downloaded, if autoupdate is
+#                      on and the moment is safe: "boot" (the supervisor, before it starts
+#                      the service) unless a streaming app is already in the foreground,
+#                      "idle" (the service, after a minute on the home screen) only on the
+#                      home screen. Exit status 0 = a new version was installed.
+#   maintain           periodic upkeep (run by the service): daily update check, and the
+#                      download of a new version when autoupdate is on
 #   osd                install or update the on-screen level app from the copy in this package
+PATH=/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH} # the boot hook's environment has none (see supervise.sh)
+export PATH
 SVC_DIR=/media/developer/apps/usr/palm/services/io.github.dimi3h.ambilight.service
 SVC=io.github.dimi3h.ambilight.service
 APP=io.github.dimi3h.ambilight
@@ -130,6 +140,7 @@ status() {
 # --- settings: read $STATE/args into variables (defaults first)
 read_settings() {
     host=192.168.129.249 port=19444 priority=150 gain=1.0 letterbox=on uiblend=on colorkeys=off
+    subfilter=on autoupdate=off
     # shellcheck disable=SC2046 # word splitting of the args file is intended
     set -- $(cat "$STATE/args" 2> /dev/null)
     while [ $# -gt 0 ]; do
@@ -140,6 +151,8 @@ read_settings() {
             --gain) gain=$2; shift ;;
             --no-letterbox) letterbox=off ;;
             --no-ui-blend) uiblend=off ;;
+            --keep-subtitles) subfilter=off ;;
+            --auto-update) autoupdate=on ;;
             --toggle-key) colorkeys=on; shift ;;
             --dim-key | --bright-key) shift ;;
         esac
@@ -151,6 +164,8 @@ write_settings() {
     line="--host $host --port $port --priority $priority --gain $gain"
     [ "$letterbox" = off ] && line="$line --no-letterbox"
     [ "$uiblend" = off ] && line="$line --no-ui-blend"
+    [ "$subfilter" = off ] && line="$line --keep-subtitles"
+    [ "$autoupdate" = on ] && line="$line --auto-update"
     [ "$colorkeys" = on ] && line="$line --toggle-key $BLUE_KEY --dim-key $GREEN_KEY --bright-key $YELLOW_KEY"
     echo "$line" > "$STATE/args.tmp" && mv "$STATE/args.tmp" "$STATE/args"
     sync
@@ -180,7 +195,7 @@ set_settings() {
                 case "$v" in '' | *[!0-9.]* | *.*.*) fail "invalid gain" ;; esac
                 awk -v g="$v" 'BEGIN { exit !(g >= 0.1 && g <= 2.0) }' || fail "invalid gain"
                 gain=$v ;;
-            letterbox | uiblend)
+            letterbox | uiblend | subfilter | autoupdate)
                 case "$v" in on | off) ;; *) fail "invalid $k" ;; esac
                 eval "$k=\$v" ;;
             colorkeys | bluekey)
@@ -190,6 +205,8 @@ set_settings() {
     done
     write_settings
     signal_service
+    # switched on while a new version is already known: fetch it now, not at the next upkeep
+    [ "$autoupdate" = on ] && (fetch_update > /dev/null 2>&1 &)
     echo '{"ok":true}'
 }
 
@@ -206,13 +223,121 @@ check_update() {
     latest=$(echo "$out" | sed -n 's/.*"latest":"\([0-9.]*\)".*/\1/p')
     case "$out" in
         *'"newer":true'*)
+            read_settings
             if [ "$(cat "$STATE/update-notified" 2> /dev/null)" != "$latest" ]; then
                 echo "$latest" > "$STATE/update-notified"
                 log "update $latest available (installed $cur)"
-                toast "Ambilight $latest is beschikbaar. Open de Ambilight-app om bij te werken."
-            fi ;;
+                # with automatic updates the message comes when it has been installed
+                [ "$autoupdate" = on ] || toast "Ambilight $latest is beschikbaar. Open de Ambilight-app om bij te werken."
+            fi
+            [ "$autoupdate" = on ] && fetch_update > /dev/null 2>&1 ;;
     esac
     echo "$out"
+}
+
+# true if version $1 is newer than $2
+newer() {
+    awk -v a="$1" -v b="$2" 'BEGIN { split(a, x, "."); split(b, y, ".")
+        for (i = 1; i <= 3; i++) { if (x[i] + 0 > y[i] + 0) exit 0; if (x[i] + 0 < y[i] + 0) exit 1 }
+        exit 1 }'
+}
+
+# What update.json says about the newest release: sets u_latest, u_url, u_sum (empty if
+# there is nothing newer or the file does not look right).
+update_info() {
+    u_latest= u_url= u_sum=
+    u=$(cat "$STATE/update.json" 2> /dev/null)
+    case "$u" in *'"newer":true'*) ;; *) return 1 ;; esac
+    u_latest=$(echo "$u" | sed -n 's|.*"latest":"\([0-9.]*\)".*|\1|p')
+    u_url=$(echo "$u" | sed -n 's|.*"ipkUrl":"\([A-Za-z0-9_.:/-]*\)".*|\1|p')
+    u_sum=$(echo "$u" | sed -n 's|.*"sha256":"\([0-9a-f]*\)".*|\1|p')
+    case "$u_url" in https://github.com/Dimi3h/ambilight/releases/download/*) ;; *) u_latest=; return 1 ;; esac
+    [ -n "$u_latest" ] && [ ${#u_sum} -eq 64 ] || { u_latest=; return 1; }
+}
+
+# Automatic updates, step 1 (any time): download the new version and check it against the
+# feed's SHA-256. Leaves $STATE/update.ipk and $STATE/update-ready (its version).
+fetch_update() {
+    update_info || return 1
+    cur=$(cat "$SVC_DIR/VERSION" 2> /dev/null || echo 0.0.0)
+    newer "$u_latest" "$cur" || return 1
+    [ "$(cat "$STATE/update-ready" 2> /dev/null)" = "$u_latest" ] && [ -f "$STATE/update.ipk" ] && return 0
+    rm -f "$STATE/update-ready" "$STATE/update.ipk"
+    if ! curl -fsSL --max-time 120 -o "$STATE/update.ipk.tmp" "$u_url" 2> "$STATE/update.err"; then
+        rm -f "$STATE/update.ipk.tmp"
+        log "update $u_latest: download failed"
+        return 1
+    fi
+    if [ "$(sha256sum "$STATE/update.ipk.tmp" | cut -d' ' -f1)" != "$u_sum" ]; then
+        rm -f "$STATE/update.ipk.tmp"
+        log "update $u_latest: checksum does not match the feed, discarded"
+        return 1
+    fi
+    mv "$STATE/update.ipk.tmp" "$STATE/update.ipk" && echo "$u_latest" > "$STATE/update-ready"
+    sync
+    log "update $u_latest downloaded and checked; it installs when the TV starts or the home screen is idle"
+}
+
+# The app in the foreground ("" = none); "?" if the TV does not answer, so that no answer is
+# never taken for no app.
+foreground_app() {
+    i=0
+    while [ $i -lt 3 ]; do
+        # stdin from /dev/null: luna-send prints nothing when its stdin is a pipe that was closed
+        r=$(luna-send -n 1 -w 5000 luna://com.webos.applicationManager/getForegroundAppInfo '{}' < /dev/null 2> /dev/null)
+        case "$r" in *'"appId"'*) echo "$r" | sed -n 's/.*"appId":"\([^"]*\)".*/\1/p'; return 0 ;; esac
+        sleep 1; i=$((i + 1))
+    done
+    echo "?"
+}
+
+# Automatic updates, step 2: install what fetch_update left, at a moment when the restart of
+# the service cannot cost anyone their light (a service that starts while protected video
+# plays gets no colours until that video stops). $1 = boot: called by the supervisor before
+# it starts the service; anything but a streaming app may be in the foreground. $1 = idle:
+# called by the running service after a minute on the home screen; only there.
+# At most three attempts per version. Returns 0 only when the new version is installed.
+auto_update() {
+    read_settings
+    [ "$autoupdate" = on ] || return 1
+    ready=$(cat "$STATE/update-ready" 2> /dev/null)
+    [ -n "$ready" ] && [ -f "$STATE/update.ipk" ] || return 1
+    cur=$(cat "$SVC_DIR/VERSION" 2> /dev/null || echo 0.0.0)
+    if ! newer "$ready" "$cur"; then # installed some other way meanwhile
+        rm -f "$STATE/update-ready" "$STATE/update.ipk" "$STATE/update-tried"
+        return 1
+    fi
+    # still what the feed names, and still the file that was checked
+    if ! update_info || [ "$u_latest" != "$ready" ] || [ "$(sha256sum "$STATE/update.ipk" | cut -d' ' -f1)" != "$u_sum" ]; then
+        rm -f "$STATE/update-ready" "$STATE/update.ipk"
+        log "update $ready: no longer matches the feed, discarded"
+        return 1
+    fi
+    tried=0
+    # shellcheck disable=SC2046
+    set -- "$1" $(cat "$STATE/update-tried" 2> /dev/null)
+    [ "$2" = "$ready" ] && case "$3" in [0-9]) tried=$3 ;; esac
+    [ "$tried" -ge 3 ] && return 1
+    fg=$(foreground_app)
+    case "$1:$fg" in
+        idle:com.webos.app.home) ;;
+        boot: | boot:com.webos.app.home | boot:com.webos.app.livetv | boot:com.webos.app.hdmi* | boot:com.webos.app.screensaver) ;;
+        *) return 1 ;; # someone is watching something: another time
+    esac
+    echo "$ready $((tried + 1))" > "$STATE/update-tried"
+    log "installing update $ready (installed $cur, $1, attempt $((tried + 1)))"
+    luna-send -n 1 -w 30000 luna://com.webos.appInstallService/dev/install \
+        "{\"id\":\"$APP\",\"ipkUrl\":\"$STATE/update.ipk\",\"subscribe\":false}" > /dev/null 2>&1
+    i=0
+    until [ "$(cat "$SVC_DIR/VERSION" 2> /dev/null)" = "$ready" ] || [ $i -ge 40 ]; do sleep 1; i=$((i + 1)); done
+    if [ $i -ge 40 ]; then
+        log "update $ready: not installed after 40 s"
+        return 1
+    fi
+    rm -f "$STATE/update-ready" "$STATE/update.ipk" "$STATE/update-tried"
+    log "update $ready installed"
+    toast "Ambilight is bijgewerkt naar versie $ready."
+    return 0
 }
 
 # Settings written by an older version: the colour-key setting used to be the blue key
@@ -224,6 +349,11 @@ migrate() {
         log "settings migrated: colour keys now include green (dim) and yellow (brighten)"
     fi
     osd_ensure # after an update of the package: bring the on-screen level along
+    # a downloaded update that is installed by now leaves nothing behind
+    rdy=$(cat "$STATE/update-ready" 2> /dev/null)
+    if [ -n "$rdy" ] && ! newer "$rdy" "$(cat "$SVC_DIR/VERSION" 2> /dev/null || echo 0.0.0)"; then
+        rm -f "$STATE/update-ready" "$STATE/update.ipk" "$STATE/update-tried"
+    fi
     # 100 % brightness is gain 2.0 since 0.2.5; a larger stored gain becomes that maximum
     if [ -f "$STATE/args" ]; then
         read_settings
@@ -239,6 +369,8 @@ migrate() {
 maintain() {
     last=$(date -r "$STATE/update.json" +%s 2> /dev/null || echo 0)
     if [ $(($(date +%s) - last)) -ge 72000 ]; then check_update > /dev/null 2>&1; fi
+    read_settings
+    [ "$autoupdate" = on ] && fetch_update > /dev/null 2>&1 # e.g. the download failed yesterday
     return 0
 }
 
@@ -273,17 +405,21 @@ json_status() {
     fi
     upd=null
     [ -f "$STATE/update.json" ] && upd=$(cat "$STATE/update.json")
+    rdy=$(cat "$STATE/update-ready" 2> /dev/null | tr -cd '0-9.')
+    if [ -n "$rdy" ] && [ -f "$STATE/update.ipk" ]; then rdy="\"$rdy\""; else rdy=null; fi
     logl=""
     if [ -f "$STATE/ambilight.log" ]; then
         logl=$(tail -n 4 "$STATE/ambilight.log" | while IFS= read -r l; do printf '"%s",' "$(printf '%s' "$l" | jstr)"; done)
     fi
     printf '{"running":%s,"supervisor":%s,"autostart":%s,"paused":%s,"disabled":%s,"boot_count":%s,"version":"%s",' \
         "$r" "$sv" "$hook" "$paused" "$dis" "$bc" "$ver"
-    printf '"settings":{"host":"%s","port":%s,"priority":%s,"gain":%s,"letterbox":%s,"ui_blend":%s,"colorkeys":%s,"bluekey":%s},' \
+    printf '"settings":{"host":"%s","port":%s,"priority":%s,"gain":%s,"letterbox":%s,"ui_blend":%s,"colorkeys":%s,"bluekey":%s,' \
         "$host" "$port" "$priority" "$gain" "$([ "$letterbox" = on ] && echo true || echo false)" \
         "$([ "$uiblend" = on ] && echo true || echo false)" "$([ "$colorkeys" = on ] && echo true || echo false)" \
         "$([ "$colorkeys" = on ] && echo true || echo false)"
-    printf '"update":%s,"status":%s,"log":[%s]}\n' "$upd" "$st" "${logl%,}"
+    printf '"subfilter":%s,"autoupdate":%s},' "$([ "$subfilter" = on ] && echo true || echo false)" \
+        "$([ "$autoupdate" = on ] && echo true || echo false)"
+    printf '"update":%s,"update_ready":%s,"status":%s,"log":[%s]}\n' "$upd" "$rdy" "$st" "${logl%,}"
 }
 
 case "$1" in
@@ -299,8 +435,9 @@ case "$1" in
     setup) setup && status ;;
     elevate) elevate && echo elevated ;;
     check-update) check_update ;;
+    auto-update) auto_update "$2"; exit $? ;; # the install replaces this file: nothing may follow
     maintain) maintain ;;
     osd) osd_ensure ;;
     migrate) migrate ;;
-    *) echo "usage: $0 start|stop|restart|pause|resume|toggle|status|json-status|set key=value...|setup|elevate|check-update|maintain" >&2; exit 2 ;;
+    *) echo "usage: $0 start|stop|restart|pause|resume|toggle|status|json-status|set key=value...|setup|elevate|check-update|auto-update boot|idle|maintain|osd" >&2; exit 2 ;;
 esac
