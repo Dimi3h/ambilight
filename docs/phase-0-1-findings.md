@@ -1167,3 +1167,48 @@ On the TV, with a development build staged as the downloaded update:
 Everything under `/media/developer` is world-writable on this TV (the installer makes
 directories and files 777), the service directory included. Automatic updates add nothing
 to that: who can write there could already replace what runs as root.
+
+## The rest of the delay is HyperHDR's smoothing (2026-11-12)
+
+The user asked whether the light can follow the picture faster still.
+
+On the TV there is little left: a frame is the mean of three reads one panel frame apart and
+is held for 25 ms, 21 ms on average. Sending a frame after every read (120 a second, the mean
+of the last three) would make that about 12 ms, at roughly twice the CPU: not built.
+
+HyperHDR 22.0.0.0, read in its source (`sources/infinite-color-engine`, `sources/api`):
+
+- The default smoothing type, `HybridRgbInterpolator`, is a spring with damping:
+  `acc = stiffness * diff - damping * vel`, integrated at every output step (50 a second by
+  default). `time_ms` is stored but never used by this type. It is used by `Stepper` and
+  `RgbInterpolator` (the transition ends after that time) and by `ExponentialInterpolator`
+  (as the time constant).
+- From that formula, for a step from black to white (continuous model, not measured):
+
+  | stiffness / damping | 50 % after | 90 % after |
+  | --- | --- | --- |
+  | 150 / 26 (default) | 0.14 s | 0.34 s |
+  | 600 / 50 | 0.07 s | 0.16 s |
+  | 1000 / 64 | 0.05 s | 0.12 s |
+
+  Damping of about twice the square root of the stiffness keeps it from overshooting.
+- The JSON API's `smoothing` command (`subcommand` `all` or `single`, `time` 25-5000, no
+  admin rights) changes only `time_ms`; type, stiffness, damping and the update frequency
+  are settings of the web interface. `componentstate` switches the smoothing as a whole.
+- The LED stream of the JSON API (`ledcolors`, `ledstream-start`) carries the colours from
+  before the smoothing, 10 times a second (20 at most): what the smoothing does cannot be
+  measured through the API.
+
+So it was judged by eye, with the screen switching between white and black every 0.6 s (the
+level app's development page, 8 cycles per setting; the user's saved time was 150 ms):
+
+| setting | the user saw |
+| --- | --- |
+| time 150, 75, 40, 25 and 1000 ms through the API | no difference, as the source says |
+| smoothing switched off | a little faster |
+| stiffness 1000, damping 64 (set in the web interface) | a little faster |
+
+The user chose stiffness 600 and damping 50. With the smoothing off the light flickers on
+nearly black pictures (see the section on the three measurement states), so it stays on.
+Not judged yet: dark scenes with the new values.
+
