@@ -54,6 +54,32 @@ python3 -I tools/make_icon.py 80 "$ST/usr/palm/applications/$APP/icon.png"
 python3 -I tools/make_icon.py 130 "$ST/usr/palm/applications/$APP/largeIcon.png"
 python3 -I tools/make_icon.py 256 build/icon-256.png
 
+# --- the on-screen level of the brightness keys (osd/) ---
+# A second app, because the window type belongs to the app: "topui" is a transparent top
+# layer that takes no keys (see osd/index.html). The TV's app manager only registers the one
+# app a package names (a second app directory in this package stayed unknown to it, measured),
+# so the level app is a small package of its own, carried in the service directory and
+# installed from there by `ambilightctl osd` (run at setup and by the supervisor at every
+# start). Hidden from the launcher.
+OSD="$APP.osd"
+OST=build/stage-osd
+rm -rf "$OST"
+mkdir -p "$OST/usr/palm/applications/$OSD" "$OST/usr/palm/packages/$OSD"
+cat > "$OST/usr/palm/applications/$OSD/appinfo.json" <<JSON
+{"id":"$OSD","version":"$VER","vendor":"Dimi3h","type":"web","main":"index.html",
+ "title":"Ambilight","icon":"icon.png","resolution":"1920x1080","transparent":true,
+ "defaultWindowType":"topui","noSplashOnLaunch":true,"spinnerOnLaunch":false,"visible":false,
+ "handlesRelaunch":true,"disableBackHistoryAPI":true}
+JSON
+cp osd/index.html "$OST/usr/palm/applications/$OSD/"
+cp "$ST/usr/palm/applications/$APP/icon.png" "$OST/usr/palm/applications/$OSD/icon.png"
+cat > "$OST/usr/palm/packages/$OSD/packageinfo.json" <<JSON
+{"id":"$OSD","version":"$VER","app":"$OSD"}
+JSON
+python3 -I tools/build_ipk.py --root "$OST" --out "$ST/usr/palm/services/$SVC/osd.ipk" \
+    --id "$OSD" --version "$VER" --description "Ambilight on-screen level" > /dev/null
+chmod 644 "$ST/usr/palm/services/$SVC/osd.ipk"
+
 cat > "$ST/usr/palm/packages/$APP/packageinfo.json" <<JSON
 {"id":"$APP","version":"$VER","app":"$APP","services":["$SVC"]}
 JSON

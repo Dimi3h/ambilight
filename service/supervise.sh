@@ -63,8 +63,10 @@ while [ ! -e "$STATE/disable" ]; do
             # replaced again within 30 s of a start: restart here and let the crash-loop
             # guard below count it, so a faulty detection can never loop forever
         else
-            log "package removed: removing the boot hook, stopping"
+            log "package removed: removing the boot hook and the on-screen level, stopping"
             rm -f /var/lib/webosbrew/init.d/70-ambilight
+            luna-send -n 1 -w 15000 luna://com.webos.appInstallService/dev/remove \
+                '{"id":"io.github.dimi3h.ambilight.osd","subscribe":false}' > /dev/null 2>&1
             break
         fi
     fi

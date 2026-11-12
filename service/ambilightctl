@@ -10,7 +10,8 @@
 #   status             human-readable state, disable reason, recent log lines
 #   json-status        the same as one JSON object (for the settings app)
 #   set key=value ...  change settings and apply them without a restart; keys:
-#                      host, port (1-65535), priority (1-253), gain (0.1-3.0),
+#                      host, port (1-65535), priority (1-253), gain (0.1-2.0; shown as
+#                      brightness 5-100 %: brightness = gain x 50),
 #                      letterbox (on|off), uiblend (on|off), colorkeys (on|off: on the
 #                      remote blue toggles ambilight, green dims, yellow brightens; the old
 #                      name bluekey is still accepted). Prints {"ok":...}.
@@ -19,9 +20,12 @@
 #   elevate            (re)grant the service its permissions through Homebrew Channel
 #   check-update       read the release feed now; prints the update info as JSON
 #   maintain           periodic upkeep (run by the service): daily update check
+#   osd                install or update the on-screen level app from the copy in this package
 SVC_DIR=/media/developer/apps/usr/palm/services/io.github.dimi3h.ambilight.service
 SVC=io.github.dimi3h.ambilight.service
 APP=io.github.dimi3h.ambilight
+OSD=io.github.dimi3h.ambilight.osd
+OSD_INFO=/media/developer/apps/usr/palm/applications/$OSD/appinfo.json
 STATE=/media/developer/ambilight
 HOOK=/var/lib/webosbrew/init.d/70-ambilight
 HB_ELEVATE=/media/developer/apps/usr/palm/services/org.webosbrew.hbchannel.service/elevate-service
@@ -80,8 +84,30 @@ elevate() {
     "$HB_ELEVATE" "$SVC" >> "$STATE/supervise.log" 2>&1
 }
 
+# The on-screen level of the brightness keys is a small package of its own (the TV's app
+# manager registers one app per package). It is installed from the copy next to this script
+# whenever its version differs from ours; the service uses toasts as long as it is missing.
+osd_ensure() {
+    [ -f "$SVC_DIR/osd.ipk" ] || return 0
+    want=$(cat "$SVC_DIR/VERSION" 2> /dev/null)
+    have=$(sed -n 's/.*"version":"\([0-9.]*\)".*/\1/p' "$OSD_INFO" 2> /dev/null | head -n 1)
+    [ -n "$want" ] && [ "$want" = "$have" ] && return 0
+    # the installer wants the package outside the tree it installs into
+    mkdir -p /media/developer/tmp && cp "$SVC_DIR/osd.ipk" /media/developer/tmp/ambilight-osd.ipk || return 1
+    luna-send -n 1 -w 20000 luna://com.webos.appInstallService/dev/install \
+        "{\"id\":\"$OSD\",\"ipkUrl\":\"/media/developer/tmp/ambilight-osd.ipk\",\"subscribe\":false}" > /dev/null 2>&1
+    i=0
+    until [ "$(sed -n 's/.*"version":"\([0-9.]*\)".*/\1/p' "$OSD_INFO" 2> /dev/null | head -n 1)" = "$want" ] || [ $i -ge 20 ]; do
+        sleep 1; i=$((i + 1))
+    done
+    rm -f /media/developer/tmp/ambilight-osd.ipk
+    if [ $i -ge 20 ]; then log "on-screen level: install of $want failed (was: ${have:-none})"; return 1; fi
+    log "on-screen level: installed $want (was: ${have:-none})"
+}
+
 setup() {
     elevate || echo "warning: elevation failed (see $STATE/supervise.log)"
+    osd_ensure || echo "warning: the on-screen level could not be installed (see $STATE/supervise.log)"
     mkdir -p /var/lib/webosbrew/init.d && ln -sfn "$SVC_DIR/autostart.sh" "$HOOK"
     log "setup: boot hook added"
     launch # an upgrade keeps a pause; a first install has none
@@ -152,7 +178,7 @@ set_settings() {
                 priority=$v ;;
             gain)
                 case "$v" in '' | *[!0-9.]* | *.*.*) fail "invalid gain" ;; esac
-                awk -v g="$v" 'BEGIN { exit !(g >= 0.1 && g <= 3.0) }' || fail "invalid gain"
+                awk -v g="$v" 'BEGIN { exit !(g >= 0.1 && g <= 2.0) }' || fail "invalid gain"
                 gain=$v ;;
             letterbox | uiblend)
                 case "$v" in on | off) ;; *) fail "invalid $k" ;; esac
@@ -196,6 +222,16 @@ migrate() {
         read_settings
         write_settings
         log "settings migrated: colour keys now include green (dim) and yellow (brighten)"
+    fi
+    osd_ensure # after an update of the package: bring the on-screen level along
+    # 100 % brightness is gain 2.0 since 0.2.5; a larger stored gain becomes that maximum
+    if [ -f "$STATE/args" ]; then
+        read_settings
+        if awk -v g="$gain" 'BEGIN { exit !(g > 2.0) }'; then
+            gain=2.0
+            write_settings
+            log "settings migrated: gain limited to 2.0 (shown as 100 % brightness)"
+        fi
     fi
     return 0
 }
@@ -264,6 +300,7 @@ case "$1" in
     elevate) elevate && echo elevated ;;
     check-update) check_update ;;
     maintain) maintain ;;
+    osd) osd_ensure ;;
     migrate) migrate ;;
     *) echo "usage: $0 start|stop|restart|pause|resume|toggle|status|json-status|set key=value...|setup|elevate|check-update|maintain" >&2; exit 2 ;;
 esac

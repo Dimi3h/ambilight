@@ -33,7 +33,8 @@ mkdir -p "$dir"
 scp -q -O $KEY "root@$TV:$STATE/*.log*" "$dir/" 2> /dev/null || true
 was=$(ssh_tv "cat $STATE/piccap-autostart 2>/dev/null || true")
 
-echo "== remove package"
+echo "== remove the on-screen level and the package"
+luna_tv "luna-send -n 3 -w 20000 luna://com.webos.appInstallService/dev/remove '{\"id\":\"$APP.osd\",\"subscribe\":true}' > /dev/null"
 luna_tv "luna-send -n 4 -w 20000 luna://com.webos.appInstallService/dev/remove '{\"id\":\"$APP\",\"subscribe\":true}' > /dev/null"
 i=0
 while ssh_tv "[ -e $SVC_DIR ]"; do

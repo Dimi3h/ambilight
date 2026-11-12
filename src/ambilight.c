@@ -69,6 +69,7 @@ static int g_interval_ms = DEFAULT_INTERVAL_MS;
 static int g_phases = DEFAULT_PHASES;
 static int g_frame_us = DEFAULT_FRAME_US;
 static int g_duration_ms = 1000;  // image expiry if the service stops feeding
+#define GAIN_MAX 2.0              // shown to the user as 100 %
 static double g_gain = 1.0;       // overall brightness gain before HyperHDR's own adjustment
 static int g_ui_cap_w = 320, g_ui_cap_h = 180;
 static int g_status_ms = 60000;    // status line interval (--status-ms)
@@ -1517,7 +1518,10 @@ static void apply_args(int argc, char** argv)
         else if (!strcmp(argv[i], "--interval") && i + 1 < argc) g_interval_ms = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--phases") && i + 1 < argc) g_phases = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--frame-us") && i + 1 < argc) g_frame_us = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--gain") && i + 1 < argc) g_gain = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--gain") && i + 1 < argc) {
+            g_gain = atof(argv[++i]);
+            if (g_gain > GAIN_MAX) g_gain = GAIN_MAX; // a setting from before 100 % became the maximum
+        }
         else if (!strcmp(argv[i], "--no-ui-blend")) g_ui_blend = false;
         else if (!strcmp(argv[i], "--linear")) g_linear = true;
         else if (!strcmp(argv[i], "--keep-last-row")) g_keep_last_row = true;
@@ -1625,12 +1629,71 @@ static void spawn_detached(char* const argv[])
     if (c > 0) waitpid(c, NULL, 0);
 }
 
-// A short on-screen notification (the TV's own toast).
-static void toast(const char* msg)
+// A short on-screen notification: the TV's own toast. The TV paces toasts itself (measured
+// on the B4, 2026-11-12): on an idle screen a toast shows about 0.1 s after the call; while
+// another toast is visible a new one only shows 2 s after it was requested, and requests
+// behind that one wait 2 s each. Every toast stays 5 s; a display time in the request is
+// ignored and closeToast does not take a visible toast away. So the time of our last toast
+// is kept, and callers that can wait (the brightness keys) never queue a second toast
+// behind one that is still on its way.
+#define TOAST_IDLE_MS 100   // call to visible, nothing on screen
+#define TOAST_BUSY_MS 2000  // call to visible, a toast on screen
+#define TOAST_SHOWN_MS 5000 // how long a toast stays
+static uint64_t g_toast_pending_until, g_toast_visible_until; // our last toast: when it shows, when it is gone
+static int g_toast_count;       // for the tests
+static char g_toast_last[96];
+static bool g_toast_mute;       // tests: keep the bookkeeping, do not call the TV
+
+static void toast_at(const char* msg, uint64_t t)
 {
+    uint64_t shown = t + (t < g_toast_visible_until ? TOAST_BUSY_MS : TOAST_IDLE_MS);
+    g_toast_pending_until = shown;
+    g_toast_visible_until = shown + TOAST_SHOWN_MS;
+    g_toast_count++;
+    snprintf(g_toast_last, sizeof(g_toast_last), "%s", msg);
+    if (g_toast_mute) return;
     char json[256];
     snprintf(json, sizeof(json), "{\"sourceId\":\"%s\",\"message\":\"%s\"}", APP_ID, msg);
     char* argv[] = { "/usr/bin/luna-send", "-n", "1", "-a", APP_ID, "luna://com.webos.notification/createToast", json, NULL };
+    spawn_detached(argv);
+}
+
+static void toast(const char* msg) { toast_at(msg, now_ms()); }
+
+// The on-screen level: our second app (osd/index.html, id APP_ID ".osd"), a transparent
+// top-layer window that takes no keys. Launching it with parameters shows them; it hides
+// itself after 1.5 s and stays loaded, so a press shows within about 0.15 s and a run of
+// presses updates the number as it goes (a toast needs 2 s for that, see above). Used when
+// the app is installed next to this service; otherwise the toasts remain.
+#define OSD_APP_ID APP_ID ".osd"
+static bool g_osd;            // the level app is there
+static int g_osd_count;       // for the tests
+static char g_osd_last[96];
+static char g_self[256];      // this executable (set by self_init)
+
+static void osd_detect(void)
+{
+    // .../usr/palm/services/<service id>/ambilight -> .../usr/palm/applications/<level app id>/appinfo.json
+    char p[sizeof(g_self) + 96];
+    snprintf(p, sizeof(p), "%s", g_self);
+    char* at = strstr(p, "/services/");
+    g_osd = false;
+    if (!at) return;
+    snprintf(at, sizeof(p) - (size_t)(at - p), "/applications/%s/appinfo.json", OSD_APP_ID);
+    g_osd = access(p, F_OK) == 0;
+}
+
+// params: a JSON object, e.g. {"pct":75}, {"state":"off"} or {} (load the app ahead of the first
+// press; its page then draws a box too faint to see, because the TV only brings a window to
+// the screen once something is drawn in it: see osd/index.html)
+static void osd_show(const char* params)
+{
+    g_osd_count++;
+    snprintf(g_osd_last, sizeof(g_osd_last), "%s", params);
+    if (g_toast_mute) return;
+    char json[192];
+    snprintf(json, sizeof(json), "{\"id\":\"%s\",\"params\":%s}", OSD_APP_ID, params);
+    char* argv[] = { "/usr/bin/luna-send", "-n", "1", "luna://com.webos.applicationManager/launch", json, NULL };
     spawn_detached(argv);
 }
 
@@ -1653,7 +1716,10 @@ static void set_paused(bool p, bool persist, bool announce)
     if (p) hh_clear();
     g_ui_cover = 0;
     logmsg("%s%s", p ? "paused" : "resumed", announce ? " (remote key)" : "");
-    if (announce) toast(p ? "Ambilight uit" : "Ambilight aan");
+    if (announce) {
+        if (g_osd) osd_show(p ? "{\"state\":\"off\"}" : "{\"state\":\"on\"}");
+        else toast(p ? "Ambilight uit" : "Ambilight aan");
+    }
 }
 
 // Remote keys: the LG input devices are read passively (never grabbed), so the TV keeps
@@ -1757,7 +1823,6 @@ static bool wait_until(uint64_t deadline)
 }
 
 // The installed executable, to notice when a package update or removal replaces it.
-static char g_self[256];
 static struct stat g_self_st;
 
 static void self_init(void)
@@ -1788,16 +1853,26 @@ static void run_ctl(const char* a1, const char* a2)
     spawn_detached(argv);
 }
 
-// Brightness by remote key: steps of 10 percentage points within the range the settings
-// accept (10-300 %). The new value applies at once; the on-screen message and the write to
-// the settings file follow shortly after the last press, so a burst of presses gives one
-// message and one write.
-#define GAIN_STEP_PCT 10
+// Brightness. The setting is a gain on the colours: 1.0 sends them as measured, 2.0 is the
+// most there is. People read a brightness as "100 % is the maximum", so that is how it is
+// shown: brightness % = gain x 50, from 5 % (gain 0.1) to 100 % (gain 2.0), and "as measured"
+// is 50 %. A remote key moves it by 5 points (gain 0.1). The new value applies to the LEDs at
+// once and the on-screen level shows it with every press. Without the level app a toast is
+// used: a quarter of a second after the last press of a burst (one message with the final
+// value), or 0.6 s after the first press if the presses keep coming; while a toast of ours
+// is still on the screen the TV would hold the next one for 2 s anyway, so then the end of
+// the burst is awaited, and no toast is ever requested while the previous one has not
+// appeared yet. The write to the settings file follows 1.2 s after the last press.
+#define GAIN_STEP_PCT 10  // of gain: 0.1
 #define GAIN_MIN_PCT 10
-#define GAIN_MAX_PCT 300
-static uint64_t g_gain_toast_at, g_gain_save_at;
+#define GAIN_MAX_PCT 200
+#define GAIN_QUIET_MS 250     // no press for this long ends a burst
+#define GAIN_BURST_MAX_MS 600 // the first message of a burst is not held longer than this
+static uint64_t g_gain_first_at, g_gain_last_at, g_gain_save_at;
+static bool g_gain_dirty; // the value changed since the last message
 
 static int gain_pct(void) { return (int)(g_gain * 100 + 0.5); }
+static int bright_pct(void) { return (gain_pct() + 1) / 2; } // what the user sees: 5-100 %
 
 static void gain_step(int steps, uint64_t t)
 {
@@ -1805,18 +1880,30 @@ static void gain_step(int steps, uint64_t t)
     if (pct < GAIN_MIN_PCT) pct = GAIN_MIN_PCT;
     if (pct > GAIN_MAX_PCT) pct = GAIN_MAX_PCT;
     g_gain = pct / 100.0;
-    g_gain_toast_at = t + 600;
     g_gain_save_at = t + 1200;
-    logmsg("brightness %d%% (remote key)", pct);
+    logmsg("brightness %d%% (gain %.2f, remote key)", bright_pct(), g_gain);
+    if (g_osd) {
+        char params[32];
+        snprintf(params, sizeof(params), "{\"pct\":%d}", bright_pct());
+        osd_show(params);
+        return;
+    }
+    if (!g_gain_dirty) g_gain_first_at = t;
+    g_gain_dirty = true;
+    g_gain_last_at = t;
 }
 
 static void gain_followup(uint64_t t)
 {
-    if (g_gain_toast_at && t >= g_gain_toast_at) {
-        g_gain_toast_at = 0;
-        char msg[64];
-        snprintf(msg, sizeof(msg), "Ambilight helderheid %d%%", gain_pct());
-        toast(msg);
+    if (g_gain_dirty && t >= g_toast_pending_until) {
+        bool quiet = t - g_gain_last_at >= GAIN_QUIET_MS;
+        bool busy = t < g_toast_visible_until; // a toast is on screen: the next one takes 2 s whatever we do
+        if (quiet || (!busy && t - g_gain_first_at >= GAIN_BURST_MAX_MS)) {
+            char msg[64];
+            snprintf(msg, sizeof(msg), "Ambilight helderheid %d%%", bright_pct());
+            toast_at(msg, t);
+            g_gain_dirty = false;
+        }
     }
     if (g_gain_save_at && t >= g_gain_save_at) {
         g_gain_save_at = 0;
@@ -1843,6 +1930,8 @@ int main(int argc, char** argv)
     signal(SIGUSR1, on_reload);
     self_init();
     g_paused = pause_file_exists();
+    osd_detect();
+    uint64_t t_osd_warm = g_osd && keys_wanted() ? now_ms() + 20000 : 0; // load the level app ahead of the first press
 
     if (!hist_load()) { logmsg("histogram API unavailable"); return 2; }
     if (!ui_open()) logmsg("UI plane unavailable; continuing with histogram only");
@@ -1882,6 +1971,11 @@ int main(int argc, char** argv)
         if (g_maintain && t >= t_maintain) {
             t_maintain = t + 6ull * 3600 * 1000;
             run_ctl("maintain", NULL); // periodic upkeep: the daily update check
+            osd_detect();
+        }
+        if (t_osd_warm && t >= t_osd_warm) {
+            t_osd_warm = 0;
+            osd_show("{}");
         }
         gain_followup(t);
         if (keys_wanted() && (g_in_rescan || (g_nin == 0 && t - g_in_scan_t > 30000) || t - g_in_scan_t > 600000)) {

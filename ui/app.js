@@ -201,7 +201,7 @@
     if (editing !== 'host') $('vHost').value = s.host;
     if (editing !== 'port') $('vPort').value = s.port;
     if (editing !== 'priority') $('vPriority').value = s.priority;
-    if (gainPct === null || !gainTimer) gainPct = Math.round(s.gain * 100);
+    if (gainPct === null || !gainTimer) gainPct = Math.max(5, Math.min(100, Math.round(s.gain * 50))); // brightness % = gain x 50
     $('vGain').textContent = gainPct + '%';
   }
   function renderUpdate() {
@@ -288,12 +288,12 @@
 
   function stepGain(dir) {
     if (gainPct === null) return;
-    gainPct = Math.max(10, Math.min(300, gainPct + dir * 10));
+    gainPct = Math.max(5, Math.min(100, Math.round(gainPct / 5) * 5 + dir * 5));
     $('vGain').textContent = gainPct + '%';
     clearTimeout(gainTimer);
     gainTimer = setTimeout(function () {
       gainTimer = null;
-      setValue('gain', (gainPct / 100).toFixed(2));
+      setValue('gain', (gainPct / 50).toFixed(2));
     }, 400);
   }
 
