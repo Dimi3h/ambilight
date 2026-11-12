@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.2.6
+
+- Subtitles stay off the LEDs. Subtitles are drawn over the picture, so the TV's colour
+  statistics contain them: a two-line subtitle lifts the zone at the bottom centre by 2 to
+  12 of 255, and under a dark scene the bottom LEDs lit up with every line. The text is
+  recognised in the UI layer (a small, low box centred at the bottom or the top of an
+  otherwise empty layer), its share is taken out of the zones again, it is not laid over
+  the picture, and the bars at the top and bottom are not judged while it shows. Measured
+  with white test text over a film: +4 to +6 without, under 1 with. Switch: "Ondertitels negeren"
+  in the settings app (`ambilightctl set subfilter=on|off`, on by default).
+- The white point follows the TV where the picture confirms it. The TV's statistics sit
+  behind its white balance, whose white depends on the picture mode's colour temperature
+  (measured for ten settings; blue of white runs from 205 at warm 50 to 254 at cool 50).
+  One white, warm 50, was built in, so an HDR mode at warm 30 made the LEDs 8 % too blue.
+  The service now takes the setting the TV reports, but only once the picture shows that
+  white (many frames with their highest blue right at it and hardly any above). The check
+  is needed: with an HDR film on Disney+ the TV reported warm 30 while the picture's white
+  was that of warm 50. On YouTube in HDR the reported white was confirmed and in use 23 s
+  after the video started; pictures at the built-in setting are untouched.
+- Automatic updates: "Automatisch bijwerken" in the settings app (`ambilightctl set
+  autoupdate=on|off`, off by default). A new release is downloaded and checked against the
+  feed's SHA-256 by the daily check, and installed when that cannot cost anyone their
+  light: when the TV starts, before the service runs, or after a minute on the home screen
+  (the restart takes about 5 s). Never while an app plays: a service that restarts during
+  protected video has no colours until that video stops.
+- After an update the service keeps its permissions again. Homebrew Channel starts the boot
+  hook without `PATH`, and its elevation then failed ("sleep: not found") whenever a
+  supervisor that was started at boot handled an update. The scripts now set `PATH`.
+- The service follows what the TV reports about itself (foreground app, dynamic range,
+  picture mode) through three `luna-send` subscriptions; the status shows it.
+- The settings app has the two new switches and still fits one screen.
+- Diagnostics: `--snap <prefix>` (raw histogram and UI layer of one moment), `--fixed-white`
+  and `--keep-subtitles` (previous behaviour); `--calib-dump` ends when it is taken out of
+  the args file.
+
 ## 0.2.5
 
 - The colour keys answer at once. Brightness and on/off now show in a small level of our own

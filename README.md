@@ -12,8 +12,12 @@ Personal-use homebrew.
   the secure video path is untouched.
 - Reconstructs the colours at the screen edges from the 16 zones with the zones' measured
   footprints (`src/profile_b4.h`): a per-frame solve in which no cell may go below black, so
-  a zone that reads black stays black. Removes the picture mode's white-balance tint.
-- Blends the **UI plane** (menus, subtitles, launchers) on top, per pixel.
+  a zone that reads black stays black.
+- Removes the TV's white-balance tint. The white depends on the picture mode's colour
+  temperature (`src/whitepoint_b4.h`); the setting the TV reports is used once the picture
+  itself shows that white, because the report is not always what is in force.
+- Blends the **UI plane** (menus, launchers) on top, per pixel, and keeps **subtitles** off
+  the LEDs: their text is taken out of the colour statistics again.
 - Measures **black bars** (letterboxed films, 4:3 pictures) to about half a percent of the
   picture and solves over the picture between them, so the LEDs show the picture's edges;
   dark scenes do not make the bars jump, and a logo on black is not mistaken for bars.
@@ -93,8 +97,11 @@ Open **Ambilight** from the TV's app list. With the remote (▲▼ choose, OK ch
   yellow brightens in steps of 5 % (a small level at the top right shows it at once);
 - set the HyperHDR address, port and priority;
 - adjust brightness (5–100 %; it scales everything sent to the LEDs, picture and menus);
-- switch black-bar detection and UI blending (menus, subtitles) on or off;
-- check for and install updates;
+- switch black-bar detection and UI blending (menus) on or off;
+- choose whether subtitles are kept off the LEDs (on by default);
+- check for and install updates, or let new versions install by themselves: they are
+  downloaded and checked first, and installed when the TV starts or after a minute on the
+  home screen, never while an app plays (off by default);
 - see the live state: picture source, HyperHDR connection, detected bars, frames/s,
   autostart, version, recent log lines, and the reason if an emergency brake switched it
   off.
@@ -131,9 +138,12 @@ $C stop                   # service off, stays off across reboots
 $C start                  # on again (also clears the guards below and a pause)
 $C set gain=1.2 uiblend=off   # change settings live: host, port (1-65535), priority (1-253),
                               # gain (0.1-2.0; the app and the remote show it as brightness
-                              # 5-100 % = gain x 50), letterbox|uiblend|colorkeys on|off
+                              # 5-100 % = gain x 50), letterbox|uiblend|colorkeys|
+                              # subfilter|autoupdate on|off
 $C json-status            # everything as JSON (used by the settings app)
 $C check-update           # read the release feed now
+$C auto-update idle       # install a downloaded update now if the home screen is up
+                          # (the service does this itself; "boot" is the supervisor's call)
 $C setup                  # elevate + boot hook + start (the app runs this on first start)
 ```
 
@@ -142,7 +152,8 @@ Settings are stored in `/media/developer/ambilight/args` and reloaded by the ser
 `/media/developer/ambilight/` (`ambilight.log`, rotated at 512 KB; `supervise.log`); live
 state: `status.json` (written every 2 s, but only while the app or `json-status` asks for
 it, so nothing is written to the TV's flash around the clock); last update check:
-`update.json`.
+`update.json`; with automatic updates a downloaded release waits there as `update.ipk`,
+named in `update-ready`.
 
 ## Autostart and emergency brakes
 
@@ -162,6 +173,10 @@ ambilight were not installed:
 To recover after a guard tripped: read the reason with `ambilightctl status`, then
 `ambilightctl start`.
 
+With automatic updates on, the supervisor first installs a release that was downloaded
+earlier (unless a streaming app is already in the foreground) and hands over to the new
+version's supervisor; three failed attempts and that release is left alone.
+
 When the package is replaced on disk (an update) the service exits with code 75; the
 supervisor waits for the new files, re-applies the permissions and hands over to the new
 version's supervisor. Replaced again within 30 s of a start counts as a quick exit for the
@@ -173,7 +188,7 @@ supervisor removes the boot hook and stops.
 | Path | What |
 | --- | --- |
 | `/media/developer/apps/usr/palm/{applications,services,packages}/io.github.dimi3h.ambilight*` | the package (developer installer) |
-| `/media/developer/ambilight/` | logs, settings (`args`), live state (`status.json`), guard state, PicCap config backup |
+| `/media/developer/ambilight/` | logs, settings (`args`), live state (`status.json`), guard state, a downloaded update, PicCap config backup |
 | `/var/lib/webosbrew/init.d/70-ambilight` | boot hook (symlink) |
 | `/var/luna-service2-dev/…/io.github.dimi3h.ambilight*` | Luna role/permission files, written by the installer and Homebrew Channel's elevation |
 | `/var/luna/preferences/vt_devmode` | LG's developer gate for the histogram API; created only for the moment of opening the histogram and removed right after by a guard process |

@@ -27,11 +27,13 @@
   dd { margin: 0; }
   .reason { margin-top: 24px; padding: 18px 22px; border-radius: 12px; background: rgba(255,107,107,.12);
     color: var(--bad); font-size: 26px; display: none; }
-  .rows { display: flex; flex-direction: column; gap: 10px; }
-  .row { display: flex; align-items: center; justify-content: space-between; gap: 24px; padding: 11px 28px;
+  /* eleven rows fit the screen at this size; the list scrolls with the focus should more come */
+  .rows { display: flex; flex-direction: column; gap: 6px; max-height: 926px; overflow-y: auto; }
+  .rows::-webkit-scrollbar { display: none; }
+  .row { display: flex; align-items: center; justify-content: space-between; gap: 24px; padding: 5px 28px; flex: none;
     border-radius: 14px; border: 3px solid transparent; background: var(--panel); font-size: 30px; }
   .row.focus { border-color: var(--focus); background: #1f242b; }
-  .row .label small { display: block; color: var(--muted); font-size: 21px; margin-top: 3px; }
+  .row .label small { display: block; color: var(--muted); font-size: 20px; margin-top: 1px; }
   .action { min-width: 140px; text-align: center; padding: 10px 22px; border-radius: 999px; font-size: 26px;
     background: #2a2f37; color: var(--text); }
   .action.new { background: var(--accent); color: #04121f; font-weight: 600; }
@@ -86,8 +88,12 @@
       <div class="stepper"><b>◀</b><span id="vGain">–</span><b>▶</b></div></div>
     <div class="row" data-key="letterbox"><div class="label">Zwarte balken herkennen<small>Beeld oprekken bij 21:9-films</small></div>
       <div class="toggle" id="vLetterbox">–</div></div>
-    <div class="row" data-key="uiblend"><div class="label">Menu's en ondertitels meenemen<small>De UI-laag over het beeld leggen</small></div>
+    <div class="row" data-key="uiblend"><div class="label">Menu's meenemen<small>De UI-laag over het beeld leggen</small></div>
       <div class="toggle" id="vUiblend">–</div></div>
+    <div class="row" data-key="subfilter"><div class="label">Ondertitels negeren<small>Uit: ondertitels lichten mee op, zoals menu's</small></div>
+      <div class="toggle" id="vSubfilter">–</div></div>
+    <div class="row" data-key="autoupdate"><div class="label">Automatisch bijwerken<small>Bij het starten van de tv of op het startscherm, nooit tijdens het kijken</small></div>
+      <div class="toggle" id="vAutoupdate">–</div></div>
     <div class="row" data-key="update"><div class="label">Updates<small id="updateHint">–</small></div>
       <div class="action" id="vUpdate">Controleren</div></div>
   </section>

@@ -76,7 +76,9 @@
       version: '0.2.0',
       update: { checked: Date.now() / 1000 | 0, current: '0.2.0', latest: '0.2.1', newer: true,
         ipkUrl: RELEASES + 'v0.2.1/io.github.dimi3h.ambilight_0.2.1_arm.ipk', sha256: new Array(65).join('a') },
-      settings: { host: '192.168.129.249', port: 19444, priority: 150, gain: 1.0, letterbox: true, ui_blend: true, colorkeys: false } };
+      update_ready: null,
+      settings: { host: '192.168.129.249', port: 19444, priority: 150, gain: 1.0, letterbox: true, ui_blend: true, colorkeys: false,
+        subfilter: true, autoupdate: false } };
     return function (args) {
       var a = args.split(' ');
       var ok = function (x) { return Promise.resolve(JSON.stringify(x || { ok: true }) + '\n'); };
@@ -88,8 +90,9 @@
       if (a[0] === 'set') {
         a.slice(1).forEach(function (kv) {
           var k = kv.split('=')[0], v = kv.split('=')[1];
-          if (k === 'letterbox' || k === 'uiblend' || k === 'colorkeys') s.settings[k === 'uiblend' ? 'ui_blend' : k] = v === 'on';
+          if (/^(letterbox|uiblend|colorkeys|subfilter|autoupdate)$/.test(k)) s.settings[k === 'uiblend' ? 'ui_blend' : k] = v === 'on';
           else s.settings[k] = k === 'host' ? v : Number(v);
+          if (k === 'autoupdate') s.update_ready = v === 'on' ? s.update.latest : null; // the stand-in downloads at once
         });
         return ok();
       }
@@ -98,7 +101,7 @@
         hyperhdr: true, paused: s.paused } : null;
       return Promise.resolve(JSON.stringify({ running: s.running, supervisor: s.running, autostart: s.autostart,
         paused: s.paused, disabled: s.disabled, boot_count: s.boot_count, version: s.version, settings: s.settings,
-        update: s.update, status: st,
+        update: s.update, update_ready: s.update_ready, status: st,
         log: ['[85.578] histogram opened', '[145.584] frames=1199 holds=0 reopens=0 hist=open'] }));
     };
   }
@@ -197,6 +200,8 @@
     setToggle('vColorkeys', keys);
     setToggle('vLetterbox', s.letterbox);
     setToggle('vUiblend', s.ui_blend);
+    setToggle('vSubfilter', s.subfilter !== false); // a service older than 0.2.6 does not report it
+    setToggle('vAutoupdate', !!s.autoupdate);
     renderUpdate();
     if (editing !== 'host') $('vHost').value = s.host;
     if (editing !== 'port') $('vPort').value = s.port;
@@ -208,8 +213,10 @@
     var u = data && data.update, hint = $('updateHint'), btn = $('vUpdate');
     if (installing) { hint.textContent = installing; btn.textContent = 'Bezig…'; btn.className = 'action'; return; }
     if (validUpdate(u)) {
-      hint.textContent = 'Versie ' + u.latest + ' is beschikbaar (nu ' + (data.version || u.current) + ')';
-      btn.textContent = 'Installeren'; btn.className = 'action new';
+      var waiting = data.settings.autoupdate && data.update_ready === u.latest; // downloaded, installs by itself
+      hint.textContent = waiting ? 'Versie ' + u.latest + ' staat klaar · komt bij de volgende start van de tv' :
+        'Versie ' + u.latest + ' is beschikbaar (nu ' + (data.version || u.current) + ')';
+      btn.textContent = waiting ? 'Nu installeren' : 'Installeren'; btn.className = 'action new';
     } else {
       var when = u && u.checked ? new Date(u.checked * 1000) : null;
       hint.textContent = when ? 'Up-to-date · gecontroleerd ' + when.toLocaleDateString('nl-BE') + ' ' +
@@ -258,6 +265,8 @@
     } else if (key === 'colorkeys') setValue('colorkeys', (s.colorkeys === undefined ? s.bluekey : s.colorkeys) ? 'off' : 'on');
     else if (key === 'letterbox') setValue('letterbox', s.letterbox ? 'off' : 'on');
     else if (key === 'uiblend') setValue('uiblend', s.ui_blend ? 'off' : 'on');
+    else if (key === 'subfilter') setValue('subfilter', s.subfilter !== false ? 'off' : 'on');
+    else if (key === 'autoupdate') setValue('autoupdate', s.autoupdate ? 'off' : 'on');
     else if (key === 'update') update();
     else if (key === 'host' || key === 'port' || key === 'priority') startEdit(key);
     else if (key === 'gain') { /* left/right adjusts */ }
@@ -321,6 +330,7 @@
   function setFocus(i) {
     focus = Math.max(0, Math.min(rows.length - 1, i));
     rows.forEach(function (r, j) { r.classList.toggle('focus', j === focus); });
+    if (rows[focus].scrollIntoView) rows[focus].scrollIntoView({ block: 'nearest' });
   }
   function key() { return rows[focus].getAttribute('data-key'); }
 
@@ -337,7 +347,7 @@
     else if (k === KEY.ENTER) activate(key());
     else if (k === KEY.LEFT || k === KEY.RIGHT) {
       if (key() === 'gain') stepGain(k === KEY.LEFT ? -1 : 1);
-      else if (/^(power|colorkeys|letterbox|uiblend)$/.test(key())) activate(key());
+      else if (/^(power|colorkeys|letterbox|uiblend|subfilter|autoupdate)$/.test(key())) activate(key());
     } else if (k === KEY.BACK || k === KEY.ESC) {
       if (window.PalmSystem && window.PalmSystem.platformBack) window.PalmSystem.platformBack();
       else window.close();

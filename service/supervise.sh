@@ -1,9 +1,15 @@
 #!/bin/sh
 # Keeps the ambilight service running. Started detached by autostart.sh ("boot": let the
 # system settle first) or by ambilightctl ("now"). Exits when $STATE/disable appears.
+# Before the first start it lets ambilightctl install a downloaded update (automatic updates).
 # When the service exits with 75 its executable was replaced on disk: after an update the
 # new version is elevated and this script hands over to the new supervise.sh; after a
 # removal through Homebrew Channel it removes the boot hook and stops.
+# The boot hook runs without PATH in its environment. The shell finds its own commands all
+# the same, but what Homebrew Channel's elevate-service starts does not ("sleep: not found"
+# in ls-control, seen after an update: the elevation failed).
+PATH=/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}
+export PATH
 SVC_DIR=/media/developer/apps/usr/palm/services/io.github.dimi3h.ambilight.service
 STATE=/media/developer/ambilight
 BIN=$SVC_DIR/ambilight
@@ -24,6 +30,18 @@ log() {
 [ "$1" = boot ] && sleep 30
 
 "$SVC_DIR/ambilightctl" migrate > /dev/null 2>&1 # settings from an older version
+
+# Automatic updates: a new version that was downloaded earlier is installed now, before the
+# service holds anything (ambilightctl auto-update decides; it does nothing unless the user
+# switched automatic updates on). The install replaces this script, so the new supervisor
+# takes over, as after any update. The whole step is one command for the shell: nothing is
+# read from the replaced file.
+if "$SVC_DIR/ambilightctl" auto-update boot > /dev/null 2>&1; then
+    log "updated to $(cat "$SVC_DIR/VERSION" 2> /dev/null) before the start: elevating, starting the new version"
+    "$SVC_DIR/ambilightctl" elevate > /dev/null 2>&1 || log "elevation failed"
+    exec 9>&- # release the lock for the new supervisor
+    exec sh "$SVC_DIR/supervise.sh" now
+fi
 
 fast=0
 while [ ! -e "$STATE/disable" ]; do

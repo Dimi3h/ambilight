@@ -11,6 +11,8 @@
 # Homebrew Channel's own failsafe still applies: a reboot during its startup window skips
 # all hooks on the next boot. This hook returns at once; the work runs detached and only
 # starts after that window.
+PATH=/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH} # run-parts gives none (see supervise.sh)
+export PATH
 SVC_DIR=/media/developer/apps/usr/palm/services/io.github.dimi3h.ambilight.service
 STATE=/media/developer/ambilight
 
