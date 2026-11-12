@@ -28,6 +28,11 @@ Personal-use homebrew.
 - On the TV: 15-17% of one CPU core (of four) and 4 MB of memory; 0.2% while switched off.
 - For LEDs that are really off on a black picture, set HyperHDR's "Minimum backlight level"
   (Image Processing → Color Calibration) to 0; its default leaves them at 1/255.
+- How fast the LEDs follow is decided by HyperHDR's smoothing, not by the TV (about 21 ms).
+  Its default type, HybridRgbInterpolator, is a spring: Stiffness and Damping set the speed,
+  the Time field does nothing for it. The defaults (150 / 26) bring the LEDs to 90 % after
+  about 0.34 s; with Stiffness 600 and Damping 50, as used here, it is about 0.16 s. Keep
+  the smoothing on: without it the light flickers on nearly black pictures.
 
 Measurements behind every design decision: `docs/phase-0-1-findings.md`.
 
