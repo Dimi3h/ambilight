@@ -10,14 +10,18 @@ Personal-use homebrew.
   histogram keeps delivering colour statistics during protected (DRM/SVP) playback, so
   Netflix/Disney+ get ambient light too. No protected frames are captured or decrypted;
   the secure video path is untouched.
-- Reconstructs the colours at the screen edges from the 16 zones with a measured,
-  per-model operator (`src/profile_b4.h`), removes the picture mode's white-balance tint.
+- Reconstructs the colours at the screen edges from the 16 zones with the zones' measured
+  footprints (`src/profile_b4.h`): a per-frame solve in which no cell may go below black, so
+  a zone that reads black stays black. Removes the picture mode's white-balance tint.
 - Blends the **UI plane** (menus, subtitles, launchers) on top, per pixel.
 - Detects **black bars** (21:9 films) and stretches the picture to the full LED frame.
 - Sends one small PNG per frame to HyperHDR's JSON API (port 19444): **one origin,
   one priority** (150 by default). HyperHDR's LED layout and smoothing do the rest.
-- Light on the TV: about 5% of one CPU core and 4 MB of memory at 20 frames/s; 0.2% while
-  switched off.
+- 40 frames a second, each the mean of three readings (the TV's measurement cycles through
+  three states); about 21 ms from picture to HyperHDR.
+- On the TV: 15-17% of one CPU core (of four) and 4 MB of memory; 0.2% while switched off.
+- For LEDs that are really off on a black picture, set HyperHDR's "Minimum backlight level"
+  (Image Processing → Color Calibration) to 0; its default leaves them at 1/255.
 
 Measurements behind every design decision: `docs/phase-0-1-findings.md`.
 
@@ -196,7 +200,12 @@ rm -rf /media/developer/ambilight
 ## Known limits
 
 - 16 zones are coarser than a per-pixel frame grabber; validation error at the LED
-  rectangles is ~18/255 on mixed test images (see the findings).
+  rectangles is ~17/255 on mixed test images (see the findings).
+- A 4:3 picture: the left bar stays black (it has a zone of its own), the right bar gets
+  some of the picture's light, because the right edge zone is three columns wide.
+- The grid's garbage row (see the findings) is dropped from the three bottom zones on every
+  source; where that row is real picture, the bottom LEDs lose their brightest 3-5 % of
+  samples (subtitles among them).
 - Protected content only gets colours if the histogram was open before playback started.
   LG's own capture service briefly takes the capture resource on some app switches; if
   that happens right as protected playback starts, the last colours are held until a
@@ -219,10 +228,11 @@ rm -rf /media/developer/ambilight
 
 ## Development tools
 
-`sh tests/run.sh` (native unit tests: UI reader, compose/brightness, PNG encoder, update
-feed), `tools/ledtest.py` (dim test colours and an edge pattern straight to HyperHDR, to
-check a real strip's colour order and layout), `tools/calibrate.py`, `tools/letterbox.py` (offline
+`sh tests/run.sh` (native unit tests: UI reader, compose/brightness, edge estimate, PNG
+encoder, update feed), `tools/ledtest.py` (dim test colours, an edge pattern and single LEDs
+straight to HyperHDR, to check a real strip's colour order and layout), `tools/calibrate.py`, `tools/letterbox.py` (offline
 analysis of `--calib-dump` captures), `tools/ledrec.py` + `tools/validate_live.py` (live
 check of HyperHDR's LED output), the service's `--profile` flag (CPU time per loop stage,
-logged every 10 s), `probe/keywatch.c` (prints remote key codes, passively), `probe/`
+logged every 10 s), `--hist-dump` and `--hist-probe` (raw bins and read timing of the TV's
+histogram), `--linear` and `--keep-last-row` (the previous estimate, for comparison), `probe/keywatch.c` (prints remote key codes, passively), `probe/`
 (phase-1 feasibility probes) and `probe/data/` (raw measurements).

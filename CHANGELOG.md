@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.2.3
+
+- Less delay and less flicker: every output frame is now the mean of three colour readings
+  taken one panel frame apart, 40 times a second. The TV's measurement cycles through three
+  slightly different states; three readings cancel that, where the old average of two could
+  not. Delay before HyperHDR drops from about 50 ms to about 21 ms. CPU load goes from 6 %
+  to 15-17 % of one core (of four).
+- Black stays black. Two causes of light next to a black picture edge are gone:
+  - On YouTube the last row of the TV's sampling grid holds grey values that are not on the
+    screen; they lit the bottom LEDs on dark pictures (a logo on black gave 7 of 255 at the
+    bottom, up to 14). That row is now left out of the three bottom zones.
+  - The edge colours are now solved per frame with no cell allowed below black, instead of
+    one fixed operator with negative weights: a zone the TV measures as black keeps its
+    LEDs off, also next to a bright area. Slightly more accurate overall (17.2 against 17.7
+    of 255 on the validation pictures).
+  With both, that logo picture gives exactly 0 on every LED.
+- For LEDs that are fully off on black, HyperHDR's "Minimum backlight level" has to be 0
+  (README).
+- The UI layer is read every other frame.
+- New diagnostics: `--hist-probe <file>` (timing of the TV's colour measurement),
+  `--hist-dump <file>` (raw bins), `--linear` and `--keep-last-row` (previous behaviour).
+- `tools/ledtest.py`: single LEDs (`leds`, and `blink` for an LED hidden in a fold); test
+  colours now pass through HyperHDR's LED layout, so LEDs disabled there stay dark.
+
 ## 0.2.2
 
 - Colour keys: next to blue (on/off), green now dims and yellow brightens, 10 % per short
